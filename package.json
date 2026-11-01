@@ -1,0 +1,16 @@
+{
+  "name": "gemini-local-bash-mcp-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A gVisor-isolated local Bash MCP server for Gemini Apps Developer Mode.",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "sandbox:build": "node scripts/sandbox-docker.mjs build --pull=false -t gemini-mcp-sandbox:0.1.0 -f sandbox/Dockerfile sandbox"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "4.6.7"
+  }
+}
