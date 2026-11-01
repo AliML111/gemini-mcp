@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { SandboxManager } from './sandbox-manager.mjs';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +16,6 @@ const port = Number.parseInt(process.env.MCP_PORT ?? '8787', 10);
 const endpointPath = process.env.MCP_PATH ?? '/mcp';
 const sandboxImage = 'gemini-mcp-sandbox:0.1.0';
 const managedLabel = 'gemini-mcp-poc.managed=true';
-const workspaceLabel = 'gemini-mcp-poc.workspace=true';
 const sandboxRuntime = 'runsc';
 const sandboxSystemdSlice = 'app-gemini-mcp-sandbox.slice';
 const sandboxRunscWrapperPath = fileURLToPath(new URL('../scripts/runsc-scope-wrapper.sh', import.meta.url));
@@ -45,7 +46,17 @@ const workspaceMaxLifetimeMs = Number.parseInt(process.env.SANDBOX_WORKSPACE_MAX
 const maxToolCallsPerMinute = 30;
 const sandboxDockerHost = process.env.SANDBOX_DOCKER_HOST
   ?? `unix://${process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid()}`}/docker.sock`;
-const workspaces = new Map();
+const stateDbPath = process.env.SANDBOX_STATE_DB
+  ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'gemini-mcp', 'sandboxes.sqlite');
+const workspaceManager = new SandboxManager({
+  dbPath: stateDbPath,
+  docker,
+  containerArgs: sandboxContainerArgs,
+  sandboxImage,
+  maxWorkspaces: maxSandboxWorkspaces,
+  idleTtlMs: workspaceIdleTtlMs,
+  maxLifetimeMs: workspaceMaxLifetimeMs,
+});
 let activeSandboxRuns = 0;
 let toolCallWindowStartedAt = Date.now();
 let toolCallsInWindow = 0;
@@ -176,15 +187,6 @@ async function ensureSandboxBackend() {
   await verifyPerContainerResourceLimits(sliceControlGroup);
 }
 
-async function cleanupManagedContainers() {
-  const { stdout } = await docker(['ps', '-aq', '--filter', `label=${managedLabel}`]);
-  const containerIds = stdout.trim().split('\n').filter(Boolean);
-  if (containerIds.length) {
-    await docker(['rm', '--force', ...containerIds], { timeout: 10_000 });
-    console.log(`Removed ${containerIds.length} leftover sandbox container(s) from the prior MCP process.`);
-  }
-}
-
 function sandboxContainerArgs(containerName, extraLabels = []) {
   return [
     '--init',
@@ -229,46 +231,6 @@ function sandboxResultMessage({ stdout = '', stderr = '', exitCode = 0, workspac
   return `${state}\n${note}${note ? '\n' : ''}${exit}\nOutput:\n${formatSandboxOutput(stdout, stderr)}`;
 }
 
-async function removeWorkspace(workspaceId) {
-  const workspace = workspaces.get(workspaceId);
-  if (!workspace) return false;
-  workspaces.delete(workspaceId);
-  await docker(['rm', '--force', workspace.containerName], { timeout: 3_000 }).catch(() => {});
-  return true;
-}
-
-function workspaceIsExpired(workspace, now = Date.now()) {
-  return now - workspace.lastUsedAt >= workspaceIdleTtlMs
-    || now - workspace.createdAt >= workspaceMaxLifetimeMs;
-}
-
-async function createSandboxWorkspace() {
-  if (workspaces.size >= maxSandboxWorkspaces) {
-    throw new Error('All temporary workspaces are in use. Close one or wait for idle cleanup.');
-  }
-
-  const workspaceId = randomUUID();
-  const containerName = `gemini-mcp-ws-${workspaceId}`;
-  const labels = [workspaceLabel, `gemini-mcp-poc.workspace-id=${workspaceId}`];
-  const args = [
-    'run', '--detach',
-    ...sandboxContainerArgs(containerName, labels),
-    sandboxImage,
-    '/bin/sh', '-c', 'while :; do /bin/sleep 3600; done',
-  ];
-
-  try {
-    await docker(args, { timeout: 15_000 });
-  } catch (error) {
-    await docker(['rm', '--force', containerName], { timeout: 3_000 }).catch(() => {});
-    throw new Error(`Could not create the temporary gVisor workspace. Build the sandbox with \`npm run sandbox:build\`. ${error.message}`);
-  }
-
-  const now = Date.now();
-  workspaces.set(workspaceId, { containerName, createdAt: now, lastUsedAt: now });
-  return workspaceId;
-}
-
 async function runSandboxBash(command, workspaceId = null) {
   if (Buffer.byteLength(command, 'utf8') > 1_000) {
     throw new Error('Sandbox command must be at most 1,000 UTF-8 bytes.');
@@ -277,73 +239,67 @@ async function runSandboxBash(command, workspaceId = null) {
     throw new Error('Sandbox is at capacity. Retry after another run finishes.');
   }
 
-  let containerName;
-  if (workspaceId) {
-    const workspace = workspaces.get(workspaceId);
-    if (!workspace || workspaceIsExpired(workspace)) {
-      if (workspace) await removeWorkspace(workspaceId);
-      throw new Error('That temporary workspace is missing or expired. Create a new workspace to continue.');
-    }
-    workspace.lastUsedAt = Date.now();
-    containerName = workspace.containerName;
-  } else {
-    containerName = `gemini-mcp-run-${randomUUID()}`;
-  }
-
+  const containerName = `gemini-mcp-run-${randomUUID()}`;
   activeSandboxRuns += 1;
   const execution = [
     '/usr/bin/timeout', '-s', 'TERM', '-k', '1s', `${sandboxTimeoutSeconds}s`,
     '/bin/bash', '--noprofile', '--norc', '-c', command,
   ];
-  const dockerArgs = workspaceId
-    ? ['exec', '--user=10001:10001', '--workdir=/workspace', containerName, ...execution]
-    : [
-      'run', '--rm',
-      ...sandboxContainerArgs(containerName),
-      sandboxImage,
-      ...execution,
-    ];
+  const perform = async (workspaceName = null) => {
+    const dockerArgs = workspaceName
+      ? ['exec', '--user=10001:10001', '--workdir=/workspace', workspaceName, ...execution]
+      : ['run', '--rm', ...sandboxContainerArgs(containerName), sandboxImage, ...execution];
+    try {
+      const result = await docker(dockerArgs, { timeout: 8_000, maxBuffer: sandboxMaxOutputBytes * 2 });
+      return sandboxResultMessage({ stdout: result.stdout, stderr: result.stderr, workspaceId });
+    } catch (error) {
+      const stdout = typeof error.stdout === 'string' ? error.stdout : '';
+      const stderr = typeof error.stderr === 'string' ? error.stderr : '';
+      if (error.code === 124) {
+        return sandboxResultMessage({
+          stdout, stderr, exitCode: 124, workspaceId,
+          note: `Command exceeded the ${sandboxTimeoutSeconds}-second execution limit.`,
+        });
+      }
+      if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+        return sandboxResultMessage({
+          stdout, stderr, exitCode: 1, workspaceId,
+          note: `Output exceeded the ${sandboxMaxOutputBytes}-byte capture limit.`,
+        });
+      }
+      if (Number.isInteger(error.code)) {
+        return sandboxResultMessage({ stdout, stderr, exitCode: error.code, workspaceId });
+      }
+      if (error.killed || error.code === 'ETIMEDOUT') {
+        // Closing the workspace happens after execute() releases its busy mark.
+        const timeoutError = new Error('Docker operation exceeded the 8-second outer safety limit.');
+        timeoutError.workspaceTimeout = true;
+        throw timeoutError;
+      }
+      throw new Error(`Could not start the gVisor sandbox using the dedicated rootless Docker daemon. ${error.message}`);
+    }
+  };
 
   try {
-    const result = await docker(dockerArgs, {
-      timeout: 8_000,
-      maxBuffer: sandboxMaxOutputBytes * 2,
-    });
-    return sandboxResultMessage({ stdout: result.stdout, stderr: result.stderr, workspaceId });
-  } catch (error) {
-    const stdout = typeof error.stdout === 'string' ? error.stdout : '';
-    const stderr = typeof error.stderr === 'string' ? error.stderr : '';
-    if (error.code === 124) {
-      return sandboxResultMessage({
-        stdout,
-        stderr,
-        exitCode: 124,
-        workspaceId,
-        note: `Command exceeded the ${sandboxTimeoutSeconds}-second execution limit.`,
-      });
+    if (workspaceId) {
+      try {
+        return await workspaceManager.execute(workspaceId, perform);
+      } catch (error) {
+        if (error.workspaceTimeout) {
+          let removed = false;
+          try { removed = await workspaceManager.remove(workspaceId); }
+          catch (cleanupError) { console.error('Workspace timeout cleanup failed:', cleanupError.message); }
+          return sandboxResultMessage({
+            exitCode: 124,
+            note: removed
+              ? 'The Docker command exceeded the 8-second outer safety limit; its workspace was discarded.'
+              : 'The Docker command exceeded the 8-second outer safety limit; workspace cleanup is pending.',
+          });
+        }
+        throw error;
+      }
     }
-    if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-      return sandboxResultMessage({
-        stdout,
-        stderr,
-        exitCode: 1,
-        workspaceId,
-        note: `Output exceeded the ${sandboxMaxOutputBytes}-byte capture limit.`,
-      });
-    }
-    if (Number.isInteger(error.code)) {
-      return sandboxResultMessage({ stdout, stderr, exitCode: error.code, workspaceId });
-    }
-    if (error.killed || error.code === 'ETIMEDOUT') {
-      if (workspaceId) await removeWorkspace(workspaceId);
-      return sandboxResultMessage({
-        stdout,
-        stderr,
-        exitCode: 124,
-        note: 'The Docker command exceeded the 8-second outer safety limit; its workspace was discarded.',
-      });
-    }
-    throw new Error(`Could not start the gVisor sandbox using the dedicated rootless Docker daemon. ${error.message}`);
+    return await perform();
   } finally {
     if (!workspaceId) {
       await docker(['rm', '--force', containerName], { timeout: 3_000 }).catch(() => {});
@@ -352,22 +308,22 @@ async function runSandboxBash(command, workspaceId = null) {
   }
 }
 
-const workspaceCleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [workspaceId, workspace] of workspaces) {
-    if (workspaceIsExpired(workspace, now)) {
-      void removeWorkspace(workspaceId);
-    }
-  }
+let workspaceCleanupActive = false;
+const workspaceCleanupTimer = setInterval(async () => {
+  if (workspaceCleanupActive) return;
+  workspaceCleanupActive = true;
+  try { await workspaceManager.cleanupExpired(); }
+  catch (error) { console.error('Workspace cleanup failed:', error.message); }
+  finally { workspaceCleanupActive = false; }
 }, 30_000);
 workspaceCleanupTimer.unref();
 
 function createServer() {
   const server = new McpServer(
-    { name: 'gemini-local-bash-poc', version: '0.2.0' },
+    { name: 'gemini-local-bash-poc', version: '0.3.0' },
     {
       instructions:
-        'All shell execution runs in a disposable gVisor sandbox managed by a dedicated rootless Docker daemon. Each sandbox runs in its own user-systemd scope capped at 256 MiB memory, no swap, 0.25 CPU, and 64 host tasks. The shared sandbox slice caps aggregate usage at 1.5 GiB memory, no swap, 100% of one CPU, and 512 tasks; the daemon also has a 768 MiB, one-CPU, 256-task service cap. Startup refuses to serve tools unless these cgroup values are active. Sandboxes have no network or host mounts, a read-only root, a non-root user, dropped capabilities, and no-new-privileges. Each command has a 5-second limit. run_sandbox_bash creates a fresh container by default. For multi-step work, first call create_sandbox_workspace, then pass its workspace_id to run_sandbox_bash; the workspace is temporary and automatically expires. The host-task cap limits gVisor host tasks and is not a direct guest process-count limit. Never include secrets or claim these tools can access the host.',
+        'For user requests that need shell execution, call run_sandbox_bash directly; do not ask which tool to use. Use a fresh disposable sandbox for one-step commands. For multi-step work that needs files to persist between calls, call create_sandbox_workspace, pass its workspace_id to run_sandbox_bash, then close_sandbox_workspace when finished. All shell execution runs in a disposable gVisor sandbox managed by a dedicated rootless Docker daemon. Each sandbox runs in its own user-systemd scope capped at 256 MiB memory, no swap, 0.25 CPU, and 64 host tasks. The shared sandbox slice caps aggregate usage at 1.5 GiB memory, no swap, 100% of one CPU, and 512 tasks; the daemon also has a 768 MiB, one-CPU, 256-task service cap. Startup refuses to serve tools unless these cgroup values are active. Sandboxes have no network or host mounts, a read-only root, a non-root user, dropped capabilities, and no-new-privileges. Each command has a 5-second limit. Workspaces are tracked in local SQLite and automatically expire. Use list_sandbox_workspaces or inspect_sandbox_workspace to inspect workspace state. The host-task cap limits gVisor host tasks and is not a direct guest process-count limit. Never include secrets or claim these tools can access the host. Gemini approval preferences are controlled by Gemini Connected Apps, not by this MCP server.',
     },
   );
 
@@ -381,7 +337,7 @@ function createServer() {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async () => {
-      const workspaceId = await createSandboxWorkspace();
+      const workspaceId = await workspaceManager.create();
       return {
         content: [{
           type: 'text',
@@ -396,7 +352,7 @@ function createServer() {
     {
       title: 'Run Bash in an isolated gVisor sandbox',
       description:
-        'Runs Bash text in a fresh disposable gVisor container. For multi-step tasks, pass the workspace_id returned by create_sandbox_workspace to reuse its isolated temporary /workspace. Every container has no network or host mounts, a read-only root filesystem, non-root UID 10001, all Linux capabilities dropped, no-new-privileges, and Docker default seccomp. Its host gVisor scope is capped at 256 MiB memory, no swap, 0.25 CPU, and 64 host tasks. The aggregate sandbox slice is capped at 1.5 GiB memory, no swap, 100% of one CPU, and 512 tasks; the Docker service has a separate 768 MiB, one-CPU, 256-task cap. Each command has a 5-second limit and output is capped at 64 KiB. The host-task cap is not a direct guest process-count limit. Do not include secrets. Changes to fresh containers disappear after each call; workspace changes persist only until that temporary workspace expires.',
+        'Use this tool directly when the user requests shell execution; do not ask them to identify the tool. Runs Bash text in a fresh disposable gVisor container. For multi-step tasks, pass the workspace_id returned by create_sandbox_workspace to reuse its isolated temporary /workspace. Every container has no network or host mounts, a read-only root filesystem, non-root UID 10001, all Linux capabilities dropped, no-new-privileges, and Docker default seccomp. Its host gVisor scope is capped at 256 MiB memory, no swap, 0.25 CPU, and 64 host tasks. The aggregate sandbox slice is capped at 1.5 GiB memory, no swap, 100% of one CPU, and 512 tasks; the Docker service has a separate 768 MiB, one-CPU, 256-task cap. Each command has a 5-second limit and output is capped at 64 KiB. The host-task cap is not a direct guest process-count limit. Do not include secrets. Changes to fresh containers disappear after each call; workspace changes persist only until that temporary workspace expires. Gemini approval preferences are configured in Gemini Connected Apps.',
       inputSchema: {
         command: z.string().trim().min(1).max(1_000).describe('Bash command text to run only inside the isolated container; maximum 1,000 UTF-8 bytes.'),
         workspace_id: z.string().uuid().optional().describe('Optional temporary workspace ID from create_sandbox_workspace. Omit to use a fresh disposable container.'),
@@ -419,11 +375,37 @@ function createServer() {
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ workspace_id: workspaceId }) => {
-      const removed = await removeWorkspace(workspaceId);
+      const removed = await workspaceManager.remove(workspaceId);
       return {
         content: [{ type: 'text', text: removed ? 'Temporary workspace deleted.' : 'Workspace already expired or was already deleted.' }],
       };
     },
+  );
+
+  server.registerTool(
+    'list_sandbox_workspaces',
+    {
+      title: 'List local sandbox workspaces',
+      description: 'Lists live or pending temporary gVisor workspaces tracked in the local SQLite registry; does not read workspace files.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async () => ({ content: [{ type: 'text', text: JSON.stringify(workspaceManager.list(), null, 2) }] }),
+  );
+
+  server.registerTool(
+    'inspect_sandbox_workspace',
+    {
+      title: 'Inspect sandbox workspace metadata',
+      description: 'Reports status and expiry metadata for a temporary workspace; does not run commands or read its files.',
+      inputSchema: {
+        workspace_id: z.string().uuid().describe('Workspace ID returned by create_sandbox_workspace.'),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ workspace_id: workspaceId }) => ({
+      content: [{ type: 'text', text: JSON.stringify(workspaceManager.inspect(workspaceId), null, 2) }],
+    }),
   );
 
   return server;
@@ -472,7 +454,7 @@ app.post(endpointPath, async (req, res) => {
     if (toolName === 'run_sandbox_bash') {
       const command = args.command;
       console.log(`MCP tool=${toolName} commandBytes=${Buffer.byteLength(typeof command === 'string' ? command : '', 'utf8')} persistent=${Boolean(args.workspace_id)}`);
-    } else if (toolName === 'create_sandbox_workspace' || toolName === 'close_sandbox_workspace') {
+    } else if (['create_sandbox_workspace', 'close_sandbox_workspace', 'list_sandbox_workspaces', 'inspect_sandbox_workspace'].includes(toolName)) {
       console.log(`MCP tool=${toolName}`);
     }
   }
@@ -502,12 +484,13 @@ app.delete(endpointPath, (_req, res) => res.status(405).json({ error: 'This stat
 
 async function start() {
   await ensureSandboxBackend();
-  await cleanupManagedContainers();
+  await workspaceManager.open();
+  await workspaceManager.reconcile();
   app.listen(port, '127.0.0.1', () => {
     console.log(`MCP PoC listening on http://127.0.0.1:${port}${endpointPath}`);
     console.log(`Sandbox Docker daemon: ${sandboxDockerHost} (rootless; runtime=${sandboxRuntime})`);
     console.log(`Sandbox resource policy: ${sandboxTimeoutSeconds}s per command; per-container scopes are 256 MiB memory, no swap, 0.25 CPU, 64 host tasks; the aggregate sandbox slice allows 1.5 GiB, no swap, 100% CPU, 512 tasks; the Docker service allows 768 MiB, 100% CPU, 256 tasks; max ${maxSandboxConcurrency} concurrent calls.`);
-    console.log(`Workspace policy: max ${maxSandboxWorkspaces}, ${Math.round(workspaceIdleTtlMs / 60_000)}m idle TTL, ${Math.round(workspaceMaxLifetimeMs / 60_000)}m total TTL.`);
+    console.log(`Workspace policy: max ${maxSandboxWorkspaces}, ${Math.round(workspaceIdleTtlMs / 60_000)}m idle TTL, ${Math.round(workspaceMaxLifetimeMs / 60_000)}m total TTL; SQLite=${stateDbPath}.`);
   });
 }
 

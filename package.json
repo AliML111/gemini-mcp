@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "test": "node --test test/*.test.mjs",
     "sandbox:build": "node scripts/sandbox-docker.mjs build --pull=false -t gemini-mcp-sandbox:0.1.0 -f sandbox/Dockerfile sandbox"
   },
   "dependencies": {

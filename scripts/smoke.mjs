@@ -134,7 +134,7 @@ try {
   await client.connect(transport);
   const { tools } = await client.listTools();
   const names = tools.map(({ name }) => name);
-  assert.deepEqual(names.sort(), ['close_sandbox_workspace', 'create_sandbox_workspace', 'run_sandbox_bash']);
+  assert.deepEqual(names.sort(), ['close_sandbox_workspace', 'create_sandbox_workspace', 'inspect_sandbox_workspace', 'list_sandbox_workspaces', 'run_sandbox_bash']);
   console.log('Discovered MCP tools:', names.join(', '));
 
   const capabilities = await callTool('run_sandbox_bash', {
@@ -164,15 +164,22 @@ try {
   console.log('\nSandbox command environment, filesystem, privilege, and network checks: passed');
 
   const networkIsolation = await callTool('run_sandbox_bash', {
-    command: [
-      `python3 -c 'import socket; s=socket.socket(); s.settimeout(.5); print("ipv4=blocked" if s.connect_ex(("1.1.1.1",443)) != 0 else "ipv4=available")'`,
-      `python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.settimeout(.5); print("ipv6=blocked" if s.connect_ex(("2606:4700:4700::1111",443)) != 0 else "ipv6=available")'`,
-      `python3 -c 'import socket; s=socket.socket(); s.settimeout(.5); print("host-mcp=unreachable" if s.connect_ex(("127.0.0.1",8787)) != 0 else "host-mcp=reachable")'`,
-    ].join(' && '),
+    command: `python3 -c 'import socket
+checks = [("ipv4", socket.AF_INET, ("1.1.1.1", 443)), ("ipv6", socket.AF_INET6, ("2606:4700:4700::1111", 443)), ("host-mcp", socket.AF_INET, ("127.0.0.1", 8787))]
+for name, family, address in checks:
+    sock = socket.socket(family)
+    sock.settimeout(0.1)
+    try:
+        result = sock.connect_ex(address)
+    except OSError:
+        result = 1
+    finally:
+        sock.close()
+    print(name + "=" + ("blocked" if result else "available"))'`,
   });
   assert.match(networkIsolation, /ipv4=blocked/);
   assert.match(networkIsolation, /ipv6=blocked/);
-  assert.match(networkIsolation, /host-mcp=unreachable/);
+  assert.match(networkIsolation, /host-mcp=blocked/);
   console.log('\nIPv4, IPv6, and host-loopback isolation: passed');
 
   const ephemeralWrite = await callTool('run_sandbox_bash', {
@@ -188,6 +195,10 @@ try {
   const createdWorkspace = await callTool('create_sandbox_workspace', {});
   const workspaceId = createdWorkspace.match(/workspace_id=([0-9a-f-]{36})/)?.[1];
   assert(workspaceId, 'workspace creation did not return a usable ID');
+  const initialList = JSON.parse(await callTool('list_sandbox_workspaces', {}));
+  assert(initialList.some((workspace) => workspace.workspace_id === workspaceId));
+  const workspaceInfo = JSON.parse(await callTool('inspect_sandbox_workspace', { workspace_id: workspaceId }));
+  assert.equal(workspaceInfo.state, 'ready');
   const workspaceWrite = await callTool('run_sandbox_bash', {
     workspace_id: workspaceId,
     command: 'printf "session-state" > /workspace/marker.txt && cat /workspace/marker.txt',
@@ -210,6 +221,7 @@ try {
   const closeText = await callTool('close_sandbox_workspace', { workspace_id: workspaceId });
   assert.match(closeText, /deleted/i);
   assert.deepEqual(await listManagedContainers(), [], 'explicitly closed workspace was not removed');
+  assert(!JSON.parse(await callTool('list_sandbox_workspaces', {})).some((workspace) => workspace.workspace_id === workspaceId));
   console.log('\nTemporary workspace persistence, isolation, and explicit deletion: passed');
 
   const { stdout: inspectPrelude } = await docker(['run', '--detach', '--rm', '--init', '--pull=never',
