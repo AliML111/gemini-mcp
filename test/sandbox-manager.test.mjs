@@ -241,7 +241,7 @@ test('orphan cleanup fails closed for unexpected isolation settings', async (t) 
   const orphan = fakeContainer(name, [
     'gemini-mcp-poc.managed=true', 'gemini-mcp-poc.workspace=true', `gemini-mcp-poc.workspace-id=${id}`,
   ]);
-  orphan.HostConfig.NetworkMode = 'bridge';
+  orphan.HostConfig.Privileged = true;
   dockerFake.containers.set(name, orphan);
   await assert.rejects(manager.reconcile(), /unexpected Docker isolation settings/);
   assert.equal(dockerFake.containers.size, 1);

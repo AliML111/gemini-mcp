@@ -134,7 +134,7 @@ try {
   await client.connect(transport);
   const { tools } = await client.listTools();
   const names = tools.map(({ name }) => name);
-  assert.deepEqual(names.sort(), ['close_sandbox_workspace', 'create_sandbox_workspace', 'inspect_sandbox_workspace', 'list_sandbox_workspaces', 'run_sandbox_bash']);
+  assert.deepEqual(names.sort(), ['run_sandbox_bash', 'run_sandbox_session']);
   console.log('Discovered MCP tools:', names.join(', '));
 
   const capabilities = await callTool('run_sandbox_bash', {
@@ -192,25 +192,19 @@ for name, family, address in checks:
   assert.match(ephemeralRead, /fresh-container/);
   console.log('\nFresh-container files are discarded between calls: passed');
 
-  const createdWorkspace = await callTool('create_sandbox_workspace', {});
-  const workspaceId = createdWorkspace.match(/workspace_id=([0-9a-f-]{36})/)?.[1];
-  assert(workspaceId, 'workspace creation did not return a usable ID');
-  const initialList = JSON.parse(await callTool('list_sandbox_workspaces', {}));
-  assert(initialList.some((workspace) => workspace.workspace_id === workspaceId));
-  const workspaceInfo = JSON.parse(await callTool('inspect_sandbox_workspace', { workspace_id: workspaceId }));
-  assert.equal(workspaceInfo.state, 'ready');
-  const workspaceWrite = await callTool('run_sandbox_bash', {
-    workspace_id: workspaceId,
-    command: 'printf "session-state" > /workspace/marker.txt && cat /workspace/marker.txt',
-  });
-  assert.match(workspaceWrite, /session-state/);
-  const workspaceRead = await callTool('run_sandbox_bash', {
-    workspace_id: workspaceId,
-    command: 'cat /workspace/marker.txt',
-  });
-  assert.match(workspaceRead, /session-state/);
-  const [workspaceContainerId] = await listManagedContainers(workspaceLabel);
-  assert(workspaceContainerId, 'persistent workspace container was not running');
+  const sessionCall = client.callTool({ name: 'run_sandbox_session', arguments: {
+    commands: [
+      'sleep 2; printf "session-state" > /workspace/marker.txt',
+      'cat /workspace/marker.txt',
+    ],
+  } });
+  let workspaceContainerId;
+  for (let attempt = 0; attempt < 40 && !workspaceContainerId; attempt++) {
+    const runningIds = await listManagedContainers(workspaceLabel);
+    workspaceContainerId = runningIds[0];
+    if (!workspaceContainerId) await delay(100);
+  }
+  assert(workspaceContainerId, 'managed session container was not created');
   const { stdout: workspaceInspectJson } = await docker(['inspect', workspaceContainerId]);
   const [workspaceContainer] = JSON.parse(workspaceInspectJson);
   assert.equal(workspaceContainer.HostConfig.Runtime, 'runsc');
@@ -218,11 +212,16 @@ for name, family, address in checks:
   assert.equal(workspaceContainer.HostConfig.NetworkMode, 'none');
   assert.equal(workspaceContainer.Config.User, '10001:10001');
   await assertPerContainerResourceLimits(workspaceContainer);
-  const closeText = await callTool('close_sandbox_workspace', { workspace_id: workspaceId });
-  assert.match(closeText, /deleted/i);
-  assert.deepEqual(await listManagedContainers(), [], 'explicitly closed workspace was not removed');
-  assert(!JSON.parse(await callTool('list_sandbox_workspaces', {})).some((workspace) => workspace.workspace_id === workspaceId));
-  console.log('\nTemporary workspace persistence, isolation, and explicit deletion: passed');
+  const sessionResult = await sessionCall;
+  assert.notEqual(sessionResult.isError, true, `run_sandbox_session returned an MCP error: ${textOf(sessionResult)}`);
+  const sessionReport = JSON.parse(textOf(sessionResult));
+  assert.equal(sessionReport.session_id, null);
+  assert.equal(sessionReport.session_retained, false);
+  assert.equal(sessionReport.results.length, 2);
+  assert.equal(sessionReport.results[0].exit_code, 0);
+  assert.match(sessionReport.results[1].stdout, /session-state/);
+  assert.deepEqual(await listManagedContainers(), [], 'temporary session container was not removed automatically');
+  console.log('\nBatched commands share one managed workspace and clean it up automatically: passed');
 
   const { stdout: inspectPrelude } = await docker(['run', '--detach', '--rm', '--init', '--pull=never',
     '--name', `gemini-mcp-inspect-${Date.now()}`, `--label=${managedLabel}`, '--runtime=runsc',

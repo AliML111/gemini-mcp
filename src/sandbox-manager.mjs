@@ -31,7 +31,11 @@ function validateContainer(container, row, sandboxImage = null) {
     throw new Error(`Docker container identity mismatch for workspace ${row.id}; refusing to touch it.`);
   }
   const host = container.HostConfig ?? {};
-  if (host.Runtime !== 'runsc' || host.NetworkMode !== 'none'
+  const expectedNetworkMode = row.internet_access ? 'bridge' : 'none';
+  const networkMatches = row.allowAnyNetworkMode
+    ? ['none', 'bridge'].includes(host.NetworkMode)
+    : host.NetworkMode === expectedNetworkMode;
+  if (host.Runtime !== 'runsc' || !networkMatches
       || host.ReadonlyRootfs !== true || host.Privileged !== false
       || container.Config?.User !== '10001:10001'
       || (sandboxImage && container.Config?.Image !== sandboxImage)
@@ -52,6 +56,7 @@ function validateContainer(container, row, sandboxImage = null) {
 export class SandboxManager {
   constructor({ dbPath, docker, containerArgs, sandboxImage, maxWorkspaces = 2,
     idleTtlMs = 15 * 60_000, maxLifetimeMs = 60 * 60_000,
+    lifecyclePolicies = {},
     now = () => Date.now(), uuid = randomUUID } = {}) {
     if (!isAbsolute(dbPath ?? '')) throw new Error('SANDBOX_STATE_DB must be an absolute path.');
     if (typeof docker !== 'function' || typeof containerArgs !== 'function') {
@@ -64,6 +69,7 @@ export class SandboxManager {
     this.maxWorkspaces = maxWorkspaces;
     this.idleTtlMs = idleTtlMs;
     this.maxLifetimeMs = maxLifetimeMs;
+    this.lifecyclePolicies = { conversation: { idleTtlMs, maxLifetimeMs }, ...lifecyclePolicies };
     this.now = now;
     this.uuid = uuid;
     this.db = null;
@@ -84,9 +90,23 @@ export class SandboxManager {
         container_id TEXT,
         created_at INTEGER NOT NULL,
         last_used_at INTEGER NOT NULL,
+        internet_access INTEGER NOT NULL DEFAULT 0 CHECK (internet_access IN (0,1)),
         state TEXT NOT NULL CHECK (state IN ('creating','ready','busy','deleting'))
       );
     `);
+    const columns = this.db.prepare('PRAGMA table_info(workspaces)').all();
+    if (!columns.some((column) => column.name === 'internet_access')) {
+      this.db.exec('ALTER TABLE workspaces ADD COLUMN internet_access INTEGER NOT NULL DEFAULT 0 CHECK (internet_access IN (0,1))');
+    }
+    if (!columns.some((column) => column.name === 'lifecycle')) {
+      this.db.exec("ALTER TABLE workspaces ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'conversation' CHECK (lifecycle IN ('conversation','task'))");
+    }
+    if (!columns.some((column) => column.name === 'idle_ttl_ms')) {
+      this.db.exec(`ALTER TABLE workspaces ADD COLUMN idle_ttl_ms INTEGER NOT NULL DEFAULT ${this.idleTtlMs}`);
+    }
+    if (!columns.some((column) => column.name === 'max_lifetime_ms')) {
+      this.db.exec(`ALTER TABLE workspaces ADD COLUMN max_lifetime_ms INTEGER NOT NULL DEFAULT ${this.maxLifetimeMs}`);
+    }
   }
 
   close() { this.db?.close(); this.db = null; }
@@ -94,7 +114,9 @@ export class SandboxManager {
   row(id) { return this.db.prepare('SELECT * FROM workspaces WHERE id = ?').get(id); }
   rows() { return this.db.prepare('SELECT * FROM workspaces ORDER BY created_at, id').all(); }
   expired(row, now = this.now()) {
-    return now - row.created_at >= this.maxLifetimeMs || now - row.last_used_at >= this.idleTtlMs;
+    const idleTtlMs = Number.isSafeInteger(row.idle_ttl_ms) ? row.idle_ttl_ms : this.idleTtlMs;
+    const maxLifetimeMs = Number.isSafeInteger(row.max_lifetime_ms) ? row.max_lifetime_ms : this.maxLifetimeMs;
+    return now - row.created_at >= maxLifetimeMs || now - row.last_used_at >= idleTtlMs;
   }
 
   async inspectDocker(nameOrId) {
@@ -174,7 +196,7 @@ export class SandboxManager {
         // An orphan must not consume the fixed workspace capacity forever.
         // Verify identity/isolation before deleting it; otherwise fail closed.
         if (!validId(id)) throw new Error(`Unknown managed workspace container ${container.Id} has invalid identity.`);
-        validateContainer(container, { id, container_id: null }, this.sandboxImage);
+        validateContainer(container, { id, container_id: null, allowAnyNetworkMode: true }, this.sandboxImage);
         await this.docker(['rm', '--force', container.Id], { timeout: 10_000 });
       }
     }
@@ -196,7 +218,10 @@ export class SandboxManager {
     }
   }
 
-  async create() {
+  async create({ internetAccess = false, lifecycle = 'conversation' } = {}) {
+    if (typeof internetAccess !== 'boolean') throw new Error('internetAccess must be a boolean.');
+    const policy = this.lifecyclePolicies[lifecycle];
+    if (!policy || lifecycle === 'ephemeral') throw new Error('Workspace lifecycle must be conversation or task.');
     await this.cleanupExpired();
     const id = this.uuid();
     if (!validId(id)) throw new Error('UUID generator returned an invalid v4 UUID.');
@@ -206,9 +231,9 @@ export class SandboxManager {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const { count } = this.db.prepare('SELECT count(*) AS count FROM workspaces').get();
-      if (count >= this.maxWorkspaces) throw new Error('All temporary workspaces are in use. Close one or wait for idle cleanup.');
-      this.db.prepare('INSERT INTO workspaces (id,container_name,created_at,last_used_at,state) VALUES (?,?,?,?,?)')
-        .run(id, name, now, now, 'creating');
+      if (count >= this.maxWorkspaces) throw new Error('All temporary sessions are in use. Wait for idle cleanup or retry after one expires.');
+      this.db.prepare('INSERT INTO workspaces (id,container_name,created_at,last_used_at,internet_access,lifecycle,idle_ttl_ms,max_lifetime_ms,state) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(id, name, now, now, Number(internetAccess), lifecycle, policy.idleTtlMs, policy.maxLifetimeMs, 'creating');
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -217,7 +242,7 @@ export class SandboxManager {
     try {
       await this.docker([
         'run', '--detach',
-        ...this.containerArgs(name, [WORKSPACE_LABEL, `${WORKSPACE_ID_LABEL}=${id}`]),
+        ...this.containerArgs(name, [WORKSPACE_LABEL, `${WORKSPACE_ID_LABEL}=${id}`], internetAccess),
         this.sandboxImage,
         '/bin/sh', '-c', 'while :; do /bin/sleep 3600; done',
       ], { timeout: 15_000 });
@@ -251,7 +276,7 @@ export class SandboxManager {
       return await callback(container.Name.slice(1));
     } catch (error) {
       // A missing/altered container may mean state was lost; never reuse it.
-      if (/identity mismatch|not running|no Docker container/i.test(error.message)) broken = true;
+      if (/identity mismatch|not running|no Docker container|no such container/i.test(error.message)) broken = true;
       throw error;
     } finally {
       if (broken) {
@@ -271,9 +296,14 @@ export class SandboxManager {
     return this.rows().map((row) => ({
       workspace_id: row.id,
       state: row.state,
+      internet_access: Boolean(row.internet_access),
+      lifecycle: row.lifecycle ?? 'conversation',
       created_at: new Date(row.created_at).toISOString(),
       last_used_at: new Date(row.last_used_at).toISOString(),
-      expires_at: new Date(Math.min(row.created_at + this.maxLifetimeMs, row.last_used_at + this.idleTtlMs)).toISOString(),
+      expires_at: new Date(Math.min(
+        row.created_at + (Number.isSafeInteger(row.max_lifetime_ms) ? row.max_lifetime_ms : this.maxLifetimeMs),
+        row.last_used_at + (Number.isSafeInteger(row.idle_ttl_ms) ? row.idle_ttl_ms : this.idleTtlMs),
+      )).toISOString(),
       expired: this.expired(row, now),
     }));
   }
