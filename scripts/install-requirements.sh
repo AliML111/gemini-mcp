@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 RUNSC_WRAPPER="${REPO_ROOT}/scripts/runsc-scope-wrapper.sh"
+PROJECT_RUNSC_WRAPPER="${REPO_ROOT}/scripts/runsc-project-scope-wrapper.sh"
 SANDBOX_SLICE="app-gemini-mcp-sandbox.slice"
 SANDBOX_RUNSC_VERSION="${GVISOR_VERSION:-20261026.0}"
 USER_ID="$(id -u)"
@@ -128,7 +129,8 @@ fi
 
 docker_dropin="${DOCKER_DROPIN_DIR}/90-gemini-mcp-sandbox.conf"
 expected_dropin="$(mktemp "${DOCKER_DROPIN_DIR}/.gemini-mcp-sandbox.XXXXXX")"
-cat >"${expected_dropin}" <<EOF
+legacy_dropin="$(mktemp "${DOCKER_DROPIN_DIR}/.gemini-mcp-sandbox-legacy.XXXXXX")"
+cat >"${legacy_dropin}" <<EOF
 [Service]
 Slice=${SANDBOX_SLICE}
 CPUQuota=100%
@@ -138,20 +140,38 @@ TasksMax=256
 Environment=GEMINI_MCP_RUNSC_BINARY=${runsc_binary}
 Environment=GEMINI_MCP_SANDBOX_SLICE=${SANDBOX_SLICE}
 EOF
+cat >"${expected_dropin}" <<EOF
+[Service]
+Slice=${SANDBOX_SLICE}
+CPUQuota=100%
+MemoryMax=768M
+MemorySwapMax=0
+TasksMax=256
+Environment=GEMINI_MCP_RUNSC_BINARY=${runsc_binary}
+Environment=GEMINI_MCP_SANDBOX_SLICE=${SANDBOX_SLICE}
+Environment=GEMINI_MCP_PROJECT_RUNSC_BINARY=${runsc_binary}
+Environment=GEMINI_MCP_PROJECT_SANDBOX_SLICE=${SANDBOX_SLICE}
+EOF
 if [[ -e "${docker_dropin}" ]]; then
-  if ! cmp -s "${expected_dropin}" "${docker_dropin}"; then
+  if cmp -s "${expected_dropin}" "${docker_dropin}"; then
     rm -f -- "${expected_dropin}"
-    fail "Existing ${docker_dropin} differs from this setup; it was left unchanged."
+    rm -f -- "${legacy_dropin}"
+  elif cmp -s "${legacy_dropin}" "${docker_dropin}"; then
+    mv -- "${expected_dropin}" "${docker_dropin}"
+    rm -f -- "${legacy_dropin}"
+  else
+    rm -f -- "${expected_dropin}" "${legacy_dropin}"
+    fail "Existing ${docker_dropin} differs from the known sandbox setup; it was left unchanged."
   fi
-  rm -f -- "${expected_dropin}"
 else
   mv -- "${expected_dropin}" "${docker_dropin}"
+  rm -f -- "${legacy_dropin}"
 fi
 
-node --input-type=module - "${DOCKER_DAEMON_CONFIG}" "${RUNSC_WRAPPER}" <<'NODE'
+node --input-type=module - "${DOCKER_DAEMON_CONFIG}" "${RUNSC_WRAPPER}" "${PROJECT_RUNSC_WRAPPER}" <<'NODE'
 import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 
-const [configPath, wrapperPath] = process.argv.slice(2);
+const [configPath, wrapperPath, projectWrapperPath] = process.argv.slice(2);
 let config = {};
 if (existsSync(configPath)) {
   try {
@@ -172,7 +192,22 @@ if (Array.isArray(existing) || typeof existing !== 'object') {
   throw new Error(`${configPath}: "runtimes.runsc" must be a JSON object.`);
 }
 const runtimeArgs = Array.isArray(existing.runtimeArgs) ? existing.runtimeArgs : [];
-const next = { ...config, runtimes: { ...config.runtimes, runsc: { ...existing, path: wrapperPath, runtimeArgs } } };
+const existingProject = config.runtimes['runsc-project'] ?? {};
+if (Array.isArray(existingProject) || typeof existingProject !== 'object') {
+  throw new Error(`${configPath}: "runtimes.runsc-project" must be a JSON object.`);
+}
+if (existingProject.path && existingProject.path !== projectWrapperPath) {
+  throw new Error(`${configPath}: "runtimes.runsc-project" is already configured to ${existingProject.path}; it was left unchanged.`);
+}
+const projectRuntimeArgs = Array.isArray(existingProject.runtimeArgs) ? existingProject.runtimeArgs : [];
+const next = {
+  ...config,
+  runtimes: {
+    ...config.runtimes,
+    runsc: { ...existing, path: wrapperPath, runtimeArgs },
+    'runsc-project': { ...existingProject, path: projectWrapperPath, runtimeArgs: projectRuntimeArgs },
+  },
+};
 const serialized = `${JSON.stringify(next, null, 2)}\n`;
 if (existsSync(configPath) && readFileSync(configPath, 'utf8') === serialized) process.exit(0);
 if (existsSync(configPath)) {
@@ -198,6 +233,8 @@ trap restore_context EXIT
 systemctl --user daemon-reload
 say 'Installing and starting the dedicated rootless Docker user service.'
 dockerd-rootless-setuptool.sh install --force
+say 'Restarting the rootless Docker user service to load the configured gVisor runtimes.'
+systemctl --user restart docker.service
 restore_context
 
 docker_socket="unix://${RUNTIME_DIR}/docker.sock"
@@ -210,11 +247,14 @@ docker --host "${docker_socket}" info >/dev/null 2>&1 || fail "The rootless Dock
 security_options="$(docker --host "${docker_socket}" info --format '{{json .SecurityOptions}}')"
 [[ "${security_options}" == *'name=rootless'* ]] || fail 'The dedicated Docker daemon did not report rootless mode.'
 runtime_info="$(docker --host "${docker_socket}" info --format '{{json .Runtimes}}')"
-node --input-type=module - "${runtime_info}" "${RUNSC_WRAPPER}" <<'NODE'
-const [json, expectedPath] = process.argv.slice(2);
+node --input-type=module - "${runtime_info}" "${RUNSC_WRAPPER}" "${PROJECT_RUNSC_WRAPPER}" <<'NODE'
+const [json, expectedPath, expectedProjectPath] = process.argv.slice(2);
 const runtimes = JSON.parse(json);
 if (runtimes.runsc?.path !== expectedPath) {
   throw new Error(`Docker runsc path mismatch: expected ${expectedPath}, got ${runtimes.runsc?.path ?? 'missing'}.`);
+}
+if (runtimes['runsc-project']?.path !== expectedProjectPath) {
+  throw new Error(`Docker runsc-project path mismatch: expected ${expectedProjectPath}, got ${runtimes['runsc-project']?.path ?? 'missing'}.`);
 }
 NODE
 
@@ -233,6 +273,6 @@ slice_cgroup_dir="/sys/fs/cgroup/${slice_cgroup#/}"
 [[ "$(<"${slice_cgroup_dir}/memory.swap.max")" == '0' ]] || fail 'The sandbox slice swap limit is not active.'
 [[ "$(<"${slice_cgroup_dir}/pids.max")" == '512' ]] || fail 'The sandbox slice task limit is not active.'
 
-say 'Requirements are installed. The rootless Docker daemon, gVisor runtime, and resource limits are ready.'
+say 'Requirements are installed. Rootless Docker, the gVisor runtimes, and resource limits are ready.'
 say 'The Docker CLI context has been restored; this setup did not modify the system-wide Docker daemon.'
 say 'Next: npm ci, npm run sandbox:build, then npm start.'

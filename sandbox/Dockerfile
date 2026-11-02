@@ -9,6 +9,8 @@ RUN apk add --no-cache \
       git \
       grep \
       jq \
+      nodejs \
+      npm \
       sed \
     && addgroup -S -g 10001 sandbox \
     && adduser -S -D -H -u 10001 -G sandbox -s /bin/bash sandbox \

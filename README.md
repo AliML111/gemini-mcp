@@ -7,10 +7,11 @@ This proof of concept connects Gemini Apps to local tools through MCP. Gemini re
 - `run_host_commands` is available only when `bash` and/or `powershell` is explicitly selected at startup and detected. It runs directly on the host with the MCP server user's permissions; it is not sandboxed.
 - `list_files`, `read_file`, `search_files`, `write_file`, and `edit_file` are available only when `filesystem` is selected. They are restricted to configured roots, defaulting to the project directory.
 - Browser control is available as a separate Playwright MCP connector. Gemini can use both connectors in the same panel; the browser server owns its browser lifecycle and session state.
+- The optional `project` backend runs configured web-project checks and previews inside managed gVisor sessions. Project paths and commands are explicitly configured by the MCP server administrator; the backend is not enabled by default.
 
 ## Select backends at startup
 
-Set `MCP_BACKENDS` to a comma-separated allowlist. The server probes selected host shell executables and exposes only the backends it finds. A missing host shell is skipped; selecting Docker still requires all rootless/gVisor/systemd checks to pass. Filesystem access is an explicit backend and is not enabled by default.
+Set `MCP_BACKENDS` to a comma-separated allowlist. The server probes selected host shell executables and exposes only the backends it finds. A missing host shell is skipped; selecting Docker still requires all rootless/gVisor/systemd checks to pass. Filesystem and project access are explicit backends and are not enabled by default. The project backend requires both `docker` and a JSON `MCP_PROJECTS_JSON` allowlist.
 
 ```bash
 # Default: managed gVisor Docker only
@@ -30,6 +31,9 @@ MCP_BACKENDS=docker,bash,powershell npm start
 
 # Combine isolated commands, file tools, and a detected local shell
 MCP_BACKENDS=docker,filesystem,bash npm start
+
+# Add the opt-in project build/preview workflow (requires MCP_PROJECTS_JSON)
+MCP_BACKENDS=docker,project npm start
 ```
 
 To add more file roots, set `MCP_FILESYSTEM_ROOTS` to a path-delimited list of absolute directories (`:` on Linux/macOS, `;` on Windows). For example:
@@ -69,7 +73,7 @@ Rootless Docker does not support AppArmor. gVisor and Docker's default seccomp p
 
 ## Build, run, and verify
 
-Requirements for the MCP server: Node.js 22.13+ (Node 24+ recommended for built-in SQLite) and npm. The Docker backend additionally requires Linux with a user systemd session, rootless Docker with cgroup v2, and gVisor installed as the `runsc` Docker runtime. The sandbox base image is pinned by digest in `sandbox/Dockerfile`. Host shell backends do not require Docker.
+Requirements for the MCP server: Node.js 22.13+ (Node 24+ recommended for built-in SQLite) and npm. The Docker backend additionally requires Linux with a user systemd session, rootless Docker with cgroup v2, and gVisor installed as the `runsc` Docker runtime. The optional project backend also uses the `runsc-project` runtime, which has a separate 512 MiB/0.5 CPU/128 task scope. The sandbox base image is pinned by digest in `sandbox/Dockerfile`. Host shell backends do not require Docker.
 
 On Ubuntu or Debian, install and configure the host requirements with:
 
@@ -77,7 +81,7 @@ On Ubuntu or Debian, install and configure the host requirements with:
 ./scripts/install-requirements.sh
 ```
 
-The script installs `uidmap` if needed, downloads a versioned gVisor release and verifies its SHA-512 checksum, then configures and starts a dedicated rootless Docker user service. It preserves the current Docker CLI context and system-wide Docker daemon, and keeps unrelated settings when adding the `runsc` runtime. Set `GVISOR_VERSION` to select another official release.
+The script installs `uidmap` if needed, downloads a versioned gVisor release and verifies its SHA-512 checksum, then configures and starts a dedicated rootless Docker user service. It preserves the current Docker CLI context and system-wide Docker daemon, and keeps unrelated settings when adding the `runsc` and `runsc-project` runtimes. Set `GVISOR_VERSION` to select another official release.
 
 The following settings are installed by the script and can also be applied manually.
 
@@ -127,7 +131,24 @@ npm run sandbox:build
 npm start
 ```
 
-The image build uses the rootless daemon. Runtime sandboxes use `--network=none` by default; only an explicit `internet_access: true` selects `--network=bridge`. The MCP server binds only to `127.0.0.1:8787`; the endpoint is `/mcp`.
+The image build uses the rootless daemon and includes Node.js/npm for project checks. Runtime sandboxes use `--network=none` by default; only an explicit `internet_access: true` selects `--network=bridge`. The MCP server binds only to `127.0.0.1:8787`; the endpoint is `/mcp`.
+
+### Project build, preview, and review workflow
+
+The `project` backend is opt-in and runs only projects listed in `MCP_PROJECTS_JSON`. Each profile has a short alias, an absolute project root, named commands, and an optional preview command/port. Example:
+
+```bash
+export MCP_PROJECTS_JSON='[{"id":"shop","name":"Shop UI","root":"/home/ali/projects/shop","commands":{"install":"npm ci","build":"npm run build","test":"npm test","lint":"npm run lint"},"preview":{"command":"npm run dev -- --host 0.0.0.0 --port 5173","port":5173}}]'
+MCP_BACKENDS=docker,project npm start
+```
+
+Only aliases are returned to Gemini; absolute host paths stay server-side. Project sessions snapshot source into gVisor with no host mounts. The snapshot excludes `.git`, `node_modules`, `.env*` (except `.env.example`), build output, caches, common credential files, and symlinks. The session uses a 384 MiB tmpfs workspace, 512 MiB memory, 0.5 CPU, 128 tasks, and a 30-minute idle/2-hour maximum lifetime. Build outputs and installed dependencies persist between check and preview calls, then disappear when the session is removed.
+
+Network mode is fixed when the project session starts. The default is an internal Docker network with outbound access disabled. This rootless Docker setup cannot publish ports from that internal network, so dependency downloads and browser previews require `internet_access: true` when creating the session. That gives all project commands and preview code access to the rootless bridge, which may reach host/LAN services visible to Docker, and remains enabled for the session. Get the user's approval before choosing that mode for a project. When enabled, the preview port is published to a random `127.0.0.1` port for the local Playwright MCP connector; it is not published on a public interface. A preview process can be stopped separately, and the session can be removed explicitly or by TTL.
+
+The tool sequence is: `create_review_run`, `start_project_session`, `run_project_checks` (for example `install`, `build`, `test`), `get_project_diff`, `start_project_preview`, then browser checks through Playwright. Save the browser report with `save_review_artifact`; call `browser_take_screenshot` without a filename to save an automatically named image into Playwright's configured output directory, then copy it with `save_review_screenshot` using the returned image filename. Update checklist progress with `update_review_checklist`, then finish with `finalize_review_run`. Review files are written under `.gemini-mcp/reviews/<review_id>/` inside the configured project root; they contain the plan, checklist, Git diff, command results, preview details, browser report, and screenshots. `read_review_artifact` returns saved screenshots as image content.
+
+Use a project backend only with trusted code. Build, install, and preview scripts run in gVisor as the non-root container user. Enabling session network access allows those scripts to make outbound and bridge-reachable network requests. The project backend does not run host shell commands or mount project directories into the container.
 
 ## Browser connector
 
@@ -204,12 +225,14 @@ Approval preferences belong to Gemini, not the MCP protocol. Google documents an
 
 ## Files
 
-- `src/server.mjs` — MCP server and selectable Docker/Bash/PowerShell/filesystem backends.
+- `src/server.mjs` — MCP server and selectable Docker/Bash/PowerShell/filesystem/project backends.
+- `src/project-workflow.mjs` — configured project snapshots, isolated checks, preview sessions, and review artifacts.
 - `src/filesystem-backend.mjs` — root-scoped local file listing, reading, search, writing, and exact-passage edits.
 - `src/sandbox-manager.mjs` — focused SQLite workspace lifecycle, TTL cleanup, and Docker reconciliation.
 - `test/sandbox-manager.test.mjs` — unit tests without Docker.
 - `sandbox/Dockerfile` — pinned sandbox image definition.
 - `scripts/sandbox-docker.mjs` — directs image builds to the dedicated rootless daemon.
 - `scripts/runsc-scope-wrapper.sh` — launches each gVisor runtime process inside its own resource-limited user-systemd scope.
+- `scripts/runsc-project-scope-wrapper.sh` — applies a separate 512 MiB gVisor scope for project builds and previews.
 - `scripts/install-requirements.sh` — installs host prerequisites and configures the dedicated rootless Docker/gVisor backend.
 - `scripts/smoke.mjs` — MCP, isolation, lifecycle, and resource-cap checks.

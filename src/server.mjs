@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { SandboxManager } from './sandbox-manager.mjs';
 import { initializeFilesystemBackend } from './filesystem-backend.mjs';
+import { loadProjectProfiles, ProjectWorkflow } from './project-workflow.mjs';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -18,8 +19,10 @@ const endpointPath = process.env.MCP_PATH ?? '/mcp';
 const sandboxImage = 'gemini-mcp-sandbox:0.1.0';
 const managedLabel = 'gemini-mcp-poc.managed=true';
 const sandboxRuntime = 'runsc';
+const projectRunscRuntime = 'runsc-project';
 const sandboxSystemdSlice = 'app-gemini-mcp-sandbox.slice';
 const sandboxRunscWrapperPath = fileURLToPath(new URL('../scripts/runsc-scope-wrapper.sh', import.meta.url));
+const projectRunscWrapperPath = fileURLToPath(new URL('../scripts/runsc-project-scope-wrapper.sh', import.meta.url));
 const sandboxTimeoutSeconds = 5;
 const hostCommandTimeoutMs = sandboxTimeoutSeconds * 1_000;
 const sandboxMaxOutputBytes = 64 * 1024;
@@ -42,6 +45,12 @@ const sandboxSliceLimits = {
   swap: '0',
   tasks: '512',
 };
+const projectContainerLimits = {
+  cpu: '50000 100000',
+  memory: String(512 * 1024 * 1024),
+  swap: '0',
+  tasks: '128',
+};
 const maxSandboxConcurrency = 2;
 const maxSandboxWorkspaces = 2;
 const workspaceIdleTtlMs = Number.parseInt(process.env.SANDBOX_WORKSPACE_IDLE_TTL_MS ?? `${15 * 60 * 1000}`, 10);
@@ -55,9 +64,12 @@ const workspaceLifecyclePolicies = {
 const maxToolCallsPerMinute = 30;
 const requestedBackends = process.env.MCP_BACKENDS?.split(',').map((item) => item.trim().toLowerCase()).filter(Boolean)
   ?? ['docker'];
-const supportedBackends = new Set(['docker', 'bash', 'powershell', 'filesystem']);
+const supportedBackends = new Set(['docker', 'project', 'bash', 'powershell', 'filesystem']);
 if (requestedBackends.length === 0 || requestedBackends.some((backend) => !supportedBackends.has(backend))) {
-  throw new Error('MCP_BACKENDS must be a comma-separated list containing docker, bash, powershell, and/or filesystem.');
+  throw new Error('MCP_BACKENDS must be a comma-separated list containing docker, project, bash, powershell, and/or filesystem.');
+}
+if (requestedBackends.includes('project') && !requestedBackends.includes('docker')) {
+  throw new Error('MCP_BACKENDS=project requires MCP_BACKENDS=docker,project.');
 }
 if (new Set(requestedBackends).size !== requestedBackends.length) {
   throw new Error('MCP_BACKENDS must not contain duplicate backends.');
@@ -68,6 +80,7 @@ const stateDbPath = process.env.SANDBOX_STATE_DB
 let workspaceManager = null;
 let workspaceCleanupTimer = null;
 let filesystemBackend = null;
+let projectWorkflow = null;
 const hostShellExecutables = new Map();
 let enabledBackends = [];
 let activeToolExecutions = 0;
@@ -102,6 +115,65 @@ async function docker(args, options = {}) {
     encoding: 'utf8',
     windowsHide: true,
     ...options,
+  });
+}
+
+function dockerInput(args, inputStream, { timeout = 120_000, maxBuffer = sandboxMaxOutputBytes } = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn('docker', ['--host', sandboxDockerHost, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let timer;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!inputStream.destroyed) inputStream.destroy();
+      if (error) {
+        child.kill('SIGTERM');
+        rejectPromise(error);
+      } else resolvePromise(result);
+    };
+    const capture = (chunks, stream, key) => {
+      stream.on('data', (chunk) => {
+        if (settled) return;
+        const nextBytes = key === 'stdout' ? stdoutBytes + chunk.length : stderrBytes + chunk.length;
+        if (nextBytes > maxBuffer) {
+          finish(new Error(`Docker streamed copy exceeded the ${maxBuffer}-byte output limit.`));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+        if (key === 'stdout') stdoutBytes = nextBytes;
+        else stderrBytes = nextBytes;
+      });
+    };
+    capture(stdout, child.stdout, 'stdout');
+    capture(stderr, child.stderr, 'stderr');
+    child.once('error', (error) => finish(new Error(`Could not start docker exec: ${error.message}`)));
+    child.once('close', (code, signal) => {
+      const output = Buffer.concat(stdout).toString('utf8');
+      const errors = Buffer.concat(stderr).toString('utf8');
+      if (code === 0) finish(null, { stdout: output, stderr: errors });
+      else {
+        const error = new Error(`Docker streamed copy failed (${signal ?? code}): ${errors.trim() || 'no diagnostic output'}`);
+        error.code = Number.isInteger(code) ? code : 1;
+        error.stdout = output;
+        error.stderr = errors;
+        finish(error);
+      }
+    });
+    inputStream.once('error', (error) => finish(new Error(`Could not read the project snapshot archive: ${error.message}`)));
+    child.stdin.once('error', (error) => {
+      if (error.code !== 'EPIPE') finish(new Error(`Could not stream the project snapshot to Docker: ${error.message}`));
+    });
+    timer = setTimeout(() => finish(new Error(`Docker streamed copy exceeded the ${Math.round(timeout / 1000)}-second limit.`)), timeout);
+    inputStream.pipe(child.stdin);
   });
 }
 
@@ -208,6 +280,63 @@ async function ensureSandboxBackend() {
   assertCgroupLimits('rootless Docker service cgroup limits', await readCgroupLimits(controlGroup), sandboxServiceLimits);
   assertCgroupLimits('sandbox aggregate systemd-slice limits', await readCgroupLimits(sliceControlGroup), sandboxSliceLimits);
   await verifyPerContainerResourceLimits(sliceControlGroup);
+}
+
+async function ensureProjectBackend() {
+  const { stdout: runtimesOutput } = await docker(['info', '--format', '{{json .Runtimes}}']);
+  const runtimes = JSON.parse(runtimesOutput);
+  if (runtimes[projectRunscRuntime]?.path !== projectRunscWrapperPath) {
+    throw new Error(`Refusing to start the project backend: Docker must configure ${projectRunscRuntime} with ${projectRunscWrapperPath}. Run scripts/install-requirements.sh, then restart the dedicated rootless Docker daemon.`);
+  }
+  try {
+    await docker(['image', 'inspect', sandboxImage]);
+  } catch {
+    throw new Error(`Refusing to start the project backend: build the project sandbox image first with npm run sandbox:build.`);
+  }
+
+  const name = `gemini-mcp-project-probe-${randomUUID()}`;
+  try {
+    await docker([
+      'run', '--detach', '--rm', '--name', name,
+      '--label', 'gemini-mcp-poc.project-probe=true',
+      `--runtime=${projectRunscRuntime}`,
+      '--memory=512m', '--memory-swap=512m', '--cpus=0.5', '--pids-limit=128',
+      '--network=none', '--read-only', '--user=10001:10001', '--cap-drop=ALL',
+      '--security-opt=no-new-privileges=true',
+      '--tmpfs=/workspace:rw,nosuid,nodev,size=384m,uid=10001,gid=10001,mode=700',
+      sandboxImage,
+      '/bin/sh', '-c', 'node --version >/dev/null && npm --version >/dev/null && sleep 30',
+    ], { timeout: 15_000 });
+    const { stdout: inspectOutput } = await docker(['inspect', name]);
+    const [container] = JSON.parse(inspectOutput);
+    const hostConfig = container.HostConfig;
+    if (hostConfig.Memory !== Number(projectContainerLimits.memory)
+      || hostConfig.MemorySwap !== Number(projectContainerLimits.memory)
+      || hostConfig.NanoCpus !== 500_000_000
+      || hostConfig.PidsLimit !== Number(projectContainerLimits.tasks)) {
+      throw new Error(`Docker did not retain the project container resource settings: ${JSON.stringify({
+        memory: hostConfig.Memory, memorySwap: hostConfig.MemorySwap,
+        nanoCpus: hostConfig.NanoCpus, pidsLimit: hostConfig.PidsLimit,
+      })}.`);
+    }
+    if (!Number.isInteger(container.State.Pid) || container.State.Pid < 1) {
+      throw new Error('The project resource probe has no live host PID.');
+    }
+    const cgroupText = await readFile(`/proc/${container.State.Pid}/cgroup`, 'utf8');
+    const cgroupPath = cgroupText.split('\n').find((line) => line.startsWith('0::'))?.slice(3);
+    const sliceControlGroup = await execFileAsync('systemctl', ['--user', 'show', sandboxSystemdSlice, '--property=ControlGroup', '--value'],
+      { timeout: 5_000, encoding: 'utf8' });
+    const expectedSlice = sliceControlGroup.stdout.trim();
+    if (!expectedSlice || !cgroupPath?.startsWith(`${expectedSlice}/`) || !cgroupPath.endsWith('.scope')) {
+      throw new Error(`The project gVisor process is outside the expected systemd scope below ${expectedSlice || sandboxSystemdSlice}.`);
+    }
+    const actual = await readCgroupLimits(cgroupPath);
+    assertCgroupLimits('project gVisor scope resource limits', actual, projectContainerLimits);
+  } catch (error) {
+    throw new Error(`Refusing to start: the project runtime and its resource limits could not be verified. ${error.message}`);
+  } finally {
+    await docker(['rm', '--force', name], { timeout: 3_000 }).catch(() => {});
+  }
 }
 
 function sandboxContainerArgs(containerName, extraLabels = [], internetAccess = false) {
@@ -609,6 +738,9 @@ function createServer() {
   if (filesystemBackend) {
     instructions.push(`Filesystem tools are confined to these configured roots: ${filesystemBackend.roots.join(', ')}. Use list_files, read_file, or search_files to inspect; write_file and edit_file can change files only inside these roots. Reads and search results have size limits.`);
   }
+  if (projectWorkflow) {
+    instructions.push('For a configured web project, create a start_project_session first. It snapshots source into a managed no-host-mount gVisor workspace; the workspace is shared by run_project_checks and start_project_preview, so dependencies and build output persist during the workflow. The snapshot excludes .git, node_modules, environment files, build output, caches, and common credential directories. Network mode is fixed when the session starts: internal/no-egress by default; internet_access=true selects the rootless bridge and may reach host/LAN services visible to it. Rootless Docker can publish preview ports only for bridge sessions, so install steps that fetch dependencies or a requested browser preview require internet_access=true and therefore allow project code outbound/host-LAN access; get the user’s approval before opting in. Run only configured install/build/test/lint actions. For browser checks, start_project_preview, use the separate Playwright connector to open the returned loopback URL, save a screenshot under the Playwright output directory if a durable image is needed, then call save_review_screenshot and stop_project_preview. Sessions expire after 30 minutes idle or 2 hours total; stop the session when finished. Review artifacts live under .gemini-mcp/reviews/<review_id>/ in the configured project root.');
+  }
   instructions.push('Never include secrets in commands. Gemini approval preferences are controlled by Gemini Connected Apps, not by this MCP server.');
   const server = new McpServer(
     { name: 'gemini-local-bash-poc', version: '0.3.0' },
@@ -809,6 +941,207 @@ function createServer() {
     );
   }
 
+  if (projectWorkflow) {
+    const projects = projectWorkflow.listProjects();
+    const projectIds = projects.map((project) => project.id);
+    const projectIdSchema = z.enum(projectIds);
+    const sessionIdSchema = z.string().uuid();
+    const projectTextResult = (result) => ({
+      content: [{ type: 'text', text: JSON.stringify(result) }],
+      structuredContent: result,
+    });
+    server.registerTool(
+      'list_projects',
+      {
+        title: 'List configured web projects',
+        description: 'Lists project aliases explicitly configured by the MCP server administrator. Does not return host paths.',
+        inputSchema: {},
+        outputSchema: { projects: z.array(z.object({ id: z.string(), name: z.string(), checks: z.array(z.string()), preview_available: z.boolean() })) },
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      },
+      async () => projectTextResult({ projects }),
+    );
+
+    server.registerTool(
+      'get_project_diff',
+      {
+        title: 'Read a project Git diff',
+        description: 'Returns Git status and a no-external-diff patch against HEAD for the configured project. It uses read-only Git commands, suppresses Git hooks and external diff/text-conversion drivers, and omits common secret file patterns. Can save the patch to a review packet.',
+        inputSchema: { project_id: projectIdSchema, review_id: z.string().uuid().optional() },
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.getProjectDiff(args)),
+    );
+
+    server.registerTool(
+      'start_project_session',
+      {
+        title: 'Start an isolated project workspace',
+        description: 'Copies a configured project snapshot into a managed gVisor workspace with no host mounts. The workspace persists build outputs and dependencies for later checks and preview. Network defaults to internal/no-egress. internet_access=true gives the whole session rootless-bridge access, which may reach host/LAN services; this is required for dependency downloads and browser preview port publishing in this rootless Docker setup. The session lasts up to 30 minutes idle or 2 hours total and has 512 MiB memory, 0.5 CPU, 128 tasks, and a 384 MiB workspace.',
+        inputSchema: { project_id: projectIdSchema, internet_access: z.boolean().default(false), review_id: z.string().uuid().optional() },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+      },
+      async (args) => projectTextResult(await projectWorkflow.createProjectSession(args)),
+    );
+
+    server.registerTool(
+      'run_project_checks',
+      {
+        title: 'Run configured project checks in gVisor',
+        description: 'Runs one to four administrator-configured install/build/test/lint commands inside a managed project session. Dependencies and build outputs persist for preview. Each action has a 180-second limit; output is capped at 64 KiB per action. The session network cannot be changed after creation.',
+        inputSchema: {
+          project_id: projectIdSchema,
+          session_id: sessionIdSchema,
+          actions: z.array(z.enum(['install', 'build', 'test', 'lint'])).min(1).max(4),
+          review_id: z.string().uuid().optional(),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+      },
+      async (args) => projectTextResult(await projectWorkflow.runProjectChecks(args)),
+    );
+
+    server.registerTool(
+      'start_project_preview',
+      {
+        title: 'Start a temporary local preview',
+        description: 'Starts the configured preview command inside the project session using its existing dependencies and build output. The project session must have been created with internet_access=true because rootless Docker can publish ports only from its bridge network; that grants the whole project session outbound and possible host/LAN access. The configured port is published only on a random 127.0.0.1 host port for local Playwright. Returns when HTTP responds or after a 30-second readiness timeout.',
+        inputSchema: { project_id: projectIdSchema, session_id: sessionIdSchema, review_id: z.string().uuid().optional() },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.startPreview(args)),
+    );
+
+    server.registerTool(
+      'list_project_sessions',
+      {
+        title: 'List active project sessions',
+        description: 'Lists the managed project workspaces and previews started during this MCP process.',
+        inputSchema: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      },
+      async () => projectTextResult(await projectWorkflow.listProjectSessions()),
+    );
+
+    server.registerTool(
+      'stop_project_preview',
+      {
+        title: 'Stop a project preview process',
+        description: 'Stops the preview process tree inside the session and returns its log excerpt. The session remains available for more checks until its TTL expires or stop_project_session is called.',
+        inputSchema: { session_id: sessionIdSchema },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+      },
+      async ({ session_id: sessionId }) => projectTextResult(await projectWorkflow.stopPreview(sessionId)),
+    );
+
+    server.registerTool(
+      'stop_project_session',
+      {
+        title: 'Stop and remove a project session',
+        description: 'Stops and removes the managed gVisor workspace and any preview process running in it.',
+        inputSchema: { session_id: sessionIdSchema },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+      },
+      async ({ session_id: sessionId }) => projectTextResult(await projectWorkflow.stopProjectSession(sessionId)),
+    );
+
+    server.registerTool(
+      'create_review_run',
+      {
+        title: 'Create a project review packet',
+        description: 'Creates a review directory under the configured project root and saves the plan, checklist, and a manifest. Returns the review_id used by later artifact tools.',
+        inputSchema: {
+          project_id: projectIdSchema,
+          title: z.string().trim().min(1).max(200),
+          plan: z.string().max(20_000),
+          checklist: z.array(z.string().trim().min(1).max(300)).max(50),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.createReviewRun(args)),
+    );
+
+    server.registerTool(
+      'update_review_checklist',
+      {
+        title: 'Update review checklist progress',
+        description: 'Replaces the checklist in a review packet with the supplied items and completion states, then updates the manifest.',
+        inputSchema: {
+          project_id: projectIdSchema,
+          review_id: z.string().uuid(),
+          items: z.array(z.object({ text: z.string().trim().min(1).max(300), complete: z.boolean() })).max(50),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.updateReviewChecklist(args)),
+    );
+
+    server.registerTool(
+      'save_review_artifact',
+      {
+        title: 'Save text evidence to a review packet',
+        description: 'Saves a diff, check results, browser report, notes, or summary inside .gemini-mcp/reviews/<review_id>/ under the configured project root. Filenames are restricted to one path-free name and text is limited to 1 MiB.',
+        inputSchema: {
+          project_id: projectIdSchema,
+          review_id: z.string().uuid(),
+          filename: z.string().min(1).max(101),
+          kind: z.enum(['diff', 'check-results', 'browser-report', 'notes', 'summary']),
+          content: z.string().max(1024 * 1024),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.saveReviewArtifact(args)),
+    );
+
+    server.registerTool(
+      'save_review_screenshot',
+      {
+        title: 'Copy a Playwright screenshot into a review packet',
+        description: 'Copies a PNG/JPEG/WebP screenshot from the configured Playwright output directory into the project review packet. The source must be relative to that directory and no larger than 10 MiB.',
+        inputSchema: {
+          project_id: projectIdSchema,
+          review_id: z.string().uuid(),
+          filename: z.string().min(1).max(101),
+          source_path: z.string().min(1).max(500),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.saveReviewScreenshot(args)),
+    );
+
+    server.registerTool(
+      'list_review_runs',
+      {
+        title: 'List saved project review packets',
+        description: 'Lists review packet manifests under the configured project root.',
+        inputSchema: { project_id: projectIdSchema },
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      },
+      async ({ project_id: projectId }) => projectTextResult(await projectWorkflow.listReviewRuns(projectId)),
+    );
+
+    server.registerTool(
+      'read_review_artifact',
+      {
+        title: 'Read a saved review artifact',
+        description: 'Reads a text artifact or returns a saved screenshot image from a review packet.',
+        inputSchema: { project_id: projectIdSchema, review_id: z.string().uuid(), filename: z.string().min(1).max(101) },
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectWorkflow.readReviewArtifact(args),
+    );
+
+    server.registerTool(
+      'finalize_review_run',
+      {
+        title: 'Finalize a project review packet',
+        description: 'Adds a summary and marks a review packet passed, needs_work, or blocked.',
+        inputSchema: { project_id: projectIdSchema, review_id: z.string().uuid(), status: z.enum(['passed', 'needs_work', 'blocked']), summary: z.string().max(10_000) },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      },
+      async (args) => projectTextResult(await projectWorkflow.finalizeReviewRun(args)),
+    );
+  }
+
   return server;
 }
 
@@ -908,25 +1241,35 @@ async function detectHostShell(shell) {
 }
 
 async function start() {
+  if (requestedBackends.includes('docker') || requestedBackends.includes('project')) {
+    sandboxDockerHost = defaultSandboxDockerHost();
+    await ensureSandboxBackend();
+  }
+  if (requestedBackends.includes('docker')) {
+    workspaceManager = new SandboxManager({
+      dbPath: stateDbPath,
+      docker,
+      containerArgs: sandboxContainerArgs,
+      sandboxImage,
+      maxWorkspaces: maxSandboxWorkspaces,
+      idleTtlMs: workspaceIdleTtlMs,
+      maxLifetimeMs: workspaceMaxLifetimeMs,
+      lifecyclePolicies: workspaceLifecyclePolicies,
+    });
+    await workspaceManager.open();
+    await workspaceManager.reconcile();
+    enabledBackends.push('docker');
+  }
+  if (requestedBackends.includes('project')) {
+    await ensureProjectBackend();
+    const profiles = await loadProjectProfiles();
+    projectWorkflow = new ProjectWorkflow({ docker, dockerInput, profiles });
+    await projectWorkflow.initialize();
+    enabledBackends.push('project');
+  }
+
   for (const backend of requestedBackends) {
-    if (backend === 'docker') {
-      sandboxDockerHost = defaultSandboxDockerHost();
-      await ensureSandboxBackend();
-      workspaceManager = new SandboxManager({
-        dbPath: stateDbPath,
-        docker,
-        containerArgs: sandboxContainerArgs,
-        sandboxImage,
-        maxWorkspaces: maxSandboxWorkspaces,
-        idleTtlMs: workspaceIdleTtlMs,
-        maxLifetimeMs: workspaceMaxLifetimeMs,
-        lifecyclePolicies: workspaceLifecyclePolicies,
-      });
-      await workspaceManager.open();
-      await workspaceManager.reconcile();
-      enabledBackends.push('docker');
-      continue;
-    }
+    if (backend === 'docker' || backend === 'project') continue;
     if (backend === 'filesystem') {
       filesystemBackend = await initializeFilesystemBackend();
       enabledBackends.push('filesystem');
@@ -969,6 +1312,9 @@ async function start() {
     }
     if (filesystemBackend) {
       console.warn(`Filesystem backend is enabled for: ${filesystemBackend.roots.join(', ')}. Gemini can read and write files in these roots; do not expose this endpoint through an unauthenticated public tunnel.`);
+    }
+    if (projectWorkflow) {
+      console.log(`Project workflow is enabled for configured aliases: ${projectWorkflow.listProjects().map((project) => project.id).join(', ')}. Source runs only from snapshots inside gVisor; preview ports bind to 127.0.0.1 and require an explicitly networked session.`);
     }
   });
 }
