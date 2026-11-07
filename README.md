@@ -9,9 +9,20 @@ This proof of concept connects Gemini Apps to local tools through MCP. Gemini re
 - Browser control is available as a separate Playwright MCP connector. Gemini can use both connectors in the same panel; the browser server owns its browser lifecycle and session state.
 - The optional `project` backend runs configured web-project checks and previews inside managed gVisor sessions. Project paths and commands are explicitly configured by the MCP server administrator; the backend is not enabled by default.
 
+All requests to the `/mcp` endpoint require OAuth 2.1 authorization code flow with PKCE. The server requires the exact public HTTPS MCP URL and an administrator-held access password at startup; Gemini's OAuth authorization page asks for that password before issuing tokens. Dynamic client registration and protected-resource metadata are enabled. OAuth client registrations and tokens are held in memory, so restarting the server requires reconnecting the Gemini custom app.
+
 ## Select backends at startup
 
 Set `MCP_BACKENDS` to a comma-separated allowlist. The server probes selected host shell executables and exposes only the backends it finds. A missing host shell is skipped; selecting Docker still requires all rootless/gVisor/systemd checks to pass. Filesystem and project access are explicit backends and are not enabled by default. The project backend requires both `docker` and a JSON `MCP_PROJECTS_JSON` allowlist.
+
+Before starting the server, set `MCP_PUBLIC_URL` to the exact HTTPS URL Gemini will use, including `/mcp`, and set a random password of at least 32 bytes:
+
+```bash
+export MCP_PUBLIC_URL='https://your-public-host.example/mcp'
+export MCP_AUTH_PASSWORD="$(openssl rand -hex 32)"
+```
+
+Keep the password private. Gemini's OAuth flow presents a server login page where you enter it; the MCP route rejects missing, expired, wrongly scoped, and wrong-resource bearer tokens. The server refuses to start if either setting is missing, the URL is not HTTPS, or its path does not match `MCP_PATH`.
 
 ```bash
 # Default: managed gVisor Docker only
@@ -51,7 +62,7 @@ $env:MCP_BACKENDS = 'powershell'
 npm start
 ```
 
-PowerShell detection tries `pwsh`/`pwsh.exe` and then `powershell`/`powershell.exe`. Bash detection tries `bash` and `bash.exe`. The `run_host_commands` batch runs commands sequentially in fresh shell processes, so variables and `cd` changes do not carry between entries; files written to the selected working directory remain on the host. Host commands have a 5-second per-command timeout, at most four commands per call, 4,000 combined command bytes, and 64 KiB output cap. They run with the server user's full permissions. Keep this backend off when using an unauthenticated public tunnel; the Quick Tunnel section below explains that the temporary URL is not authentication.
+PowerShell detection tries `pwsh`/`pwsh.exe` and then `powershell`/`powershell.exe`. Bash detection tries `bash` and `bash.exe`. The `run_host_commands` batch runs commands sequentially in fresh shell processes, so variables and `cd` changes do not carry between entries; files written to the selected working directory remain on the host. Host commands have a 5-second per-command timeout, at most four commands per call, 4,000 combined command bytes, and 64 KiB output cap. They run with the server user's full permissions. Any OAuth-authorized Gemini client can call this backend, so enable it only when you trust the people who can enter the server access password.
 
 Docker lifecycle profiles are server-owned. Ephemeral batches use one temporary container and remove it automatically. Conversation and task containers persist only for their fixed TTL profile, with expiry tracked in SQLite; Gemini does not need container create, close, or cleanup tools.
 
@@ -142,9 +153,9 @@ export MCP_PROJECTS_JSON='[{"id":"shop","name":"Shop UI","root":"/home/ali/proje
 MCP_BACKENDS=docker,project npm start
 ```
 
-Only aliases are returned to Gemini; absolute host paths stay server-side. Project sessions snapshot source into gVisor with no host mounts. The snapshot excludes `.git`, `node_modules`, `.env*` (except `.env.example`), build output, caches, common credential files, and symlinks. The session uses a 384 MiB tmpfs workspace, 512 MiB memory, 0.5 CPU, 128 tasks, and a 30-minute idle/2-hour maximum lifetime. Build outputs and installed dependencies persist between check and preview calls, then disappear when the session is removed.
+Only aliases are returned to Gemini; absolute host paths stay server-side. Project sessions snapshot source into gVisor with no host mounts. The snapshot excludes `.git`, `node_modules`, `.env*` (except `.env.example`), build output, caches, common credential files, and symlinks. Traversal counts every directory entry (including excluded files, symlinks, and empty directories), and is limited to 30,000 entries, depth 64, 30,000 files, and 256 MiB. The session uses a 384 MiB tmpfs workspace, 512 MiB memory, 0.5 CPU, 128 tasks, and a 30-minute idle/2-hour maximum lifetime. Build outputs and installed dependencies persist between check and preview calls, then disappear when the session is removed.
 
-Network mode is fixed when the project session starts. The default is an internal Docker network with outbound access disabled. This rootless Docker setup cannot publish ports from that internal network, so dependency downloads and browser previews require `internet_access: true` when creating the session. That gives all project commands and preview code access to the rootless bridge, which may reach host/LAN services visible to Docker, and remains enabled for the session. Get the user's approval before choosing that mode for a project. When enabled, the preview port is published to a random `127.0.0.1` port for the local Playwright MCP connector; it is not published on a public interface. A preview process can be stopped separately, and the session can be removed explicitly or by TTL.
+Network mode is fixed when the project session starts. The default is an internal Docker network with outbound access disabled. The MCP server rejects `internet_access: true` unless its administrator starts it with `MCP_PROJECT_ALLOW_NETWORK=true`; that setting enables callers to request project network access. This rootless Docker setup cannot publish ports from the internal network, so dependency downloads and browser previews require that server-side opt-in and a session created with `internet_access: true`. The bridge may reach host/LAN services visible to Docker, and remains enabled for the session. When enabled, the preview port is published to a random `127.0.0.1` port for the local Playwright MCP connector; it is not published on a public interface. A preview process can be stopped separately, and the session can be removed explicitly or by TTL.
 
 The tool sequence is: `create_review_run`, `start_project_session`, `run_project_checks` (for example `install`, `build`, `test`), `get_project_diff`, `start_project_preview`, then browser checks through Playwright. Save the browser report with `save_review_artifact`; call `browser_take_screenshot` without a filename to save an automatically named image into Playwright's configured output directory, then copy it with `save_review_screenshot` using the returned image filename. Update checklist progress with `update_review_checklist`, then finish with `finalize_review_run`. Review files are written under `.gemini-mcp/reviews/<review_id>/` inside the configured project root; they contain the plan, checklist, Git diff, command results, preview details, browser report, and screenshots. `read_review_artifact` returns saved screenshots as image content.
 
@@ -175,7 +186,7 @@ Add the printed `https://…trycloudflare.com/mcp` URL as a second custom app in
 
 Add `gemini-skill/SKILL.md` as a reusable skill in Gemini to teach it how to choose between the file tools, the Docker or host shell backend, and the Playwright browser connector.
 
-In another terminal, run the MCP protocol and isolation checks:
+With the server running and `MCP_PUBLIC_URL` plus `MCP_AUTH_PASSWORD` set in this shell, run the MCP protocol and isolation checks. The smoke script creates a temporary OAuth client and obtains a token using the configured password:
 
 ```bash
 npm run smoke
@@ -209,9 +220,9 @@ Gemini Apps → Customize → Connected apps → **Create custom app** accepts a
 cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8787 --http-host-header 127.0.0.1:8787
 ```
 
-Use the printed `https://…trycloudflare.com/mcp` URL, then stop the tunnel when finished. The temporary URL is the only access control in this setup: anyone who learns it can invoke the tools while it is running. Do not use this unauthenticated mode for a persistent endpoint. Gemini documents OAuth for custom MCP apps; Google does not document a generic static bearer-header setting. Add OAuth before keeping the connector available.
+Leave the tunnel running while testing. Set `MCP_PUBLIC_URL` to the printed URL plus `/mcp`, generate `MCP_AUTH_PASSWORD`, and restart the MCP server with those values before connecting Gemini. The OAuth flow opens a password page; enter the server password there. The OAuth provider implements Dynamic Client Registration, authorization code with PKCE, scoped resource-bound bearer tokens, refresh-token rotation, and protected-resource metadata, following Google's [OAuth integration guide](https://developers.google.com/connected-apps/mcp/oauth). Quick Tunnel hostnames change when restarted, so a new hostname requires updating `MCP_PUBLIC_URL`, restarting this server, and reconnecting the custom app.
 
-Do not select `bash` or `powershell` while exposing the endpoint through an unauthenticated Cloudflare Quick Tunnel. Those tools execute arbitrary commands on the server host as your user; the endpoint currently has no authentication layer.
+The authorization server keeps clients and tokens in memory. Restarting the MCP process invalidates existing tokens and registered client IDs, so reconnect the custom app after a restart. A Quick Tunnel URL is public and can expose the login page, but calls to `/mcp` still require a valid token issued after password authorization. Host-shell tools execute arbitrary commands with the server user's permissions; enable them only for trusted Gemini users.
 
 ## Antigravity-inspired split
 

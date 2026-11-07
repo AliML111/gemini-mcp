@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -8,7 +9,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const execFileAsync = promisify(execFile);
-const endpoint = process.env.MCP_URL ?? 'http://127.0.0.1:8787/mcp';
+const resourceUrl = process.env.MCP_PUBLIC_URL ? new URL(process.env.MCP_PUBLIC_URL) : null;
+const endpoint = new URL(process.env.MCP_URL ?? process.env.MCP_PUBLIC_URL ?? 'http://127.0.0.1:8787/mcp');
+const authPassword = process.env.MCP_AUTH_PASSWORD;
 const dockerHost = process.env.SANDBOX_DOCKER_HOST
   ?? `unix://${process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid()}`}/docker.sock`;
 const managedLabel = 'gemini-mcp-poc.managed=true';
@@ -27,7 +30,83 @@ const sandboxResourceFlags = [
 let sandboxSliceControlGroup = '';
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const client = new Client({ name: 'gemini-local-bash-mcp-smoke', version: '0.3.0' }, { capabilities: {} });
-const transport = new StreamableHTTPClientTransport(new URL(endpoint));
+
+async function obtainSmokeToken() {
+  if (!resourceUrl || resourceUrl.protocol !== 'https:' || !authPassword) {
+    throw new Error('Set MCP_PUBLIC_URL to the server HTTPS MCP URL and MCP_AUTH_PASSWORD to its access password before running smoke checks.');
+  }
+  const issuerUrl = new URL('/', resourceUrl.origin);
+  const metadataResponse = await fetch(new URL('/.well-known/oauth-authorization-server', issuerUrl));
+  const metadataText = await metadataResponse.text();
+  if (!metadataResponse.ok) throw new Error(`OAuth discovery failed (${metadataResponse.status}): ${metadataText}`);
+  const metadata = JSON.parse(metadataText);
+  const callbackUrl = 'https://smoke-client.example.invalid/callback';
+  const registrationResponse = await fetch(metadata.registration_endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'Local MCP smoke test',
+      redirect_uris: [callbackUrl],
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+    }),
+  });
+  const registrationText = await registrationResponse.text();
+  if (!registrationResponse.ok) throw new Error(`OAuth client registration failed (${registrationResponse.status}): ${registrationText}`);
+  const registeredClient = JSON.parse(registrationText);
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const authParams = new URLSearchParams({
+    response_type: 'code',
+    client_id: registeredClient.client_id,
+    redirect_uri: callbackUrl,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    scope: 'mcp:tools',
+    state: randomBytes(16).toString('base64url'),
+    resource: resourceUrl.href,
+  });
+  const authorizationUrl = new URL(metadata.authorization_endpoint);
+  authorizationUrl.search = authParams.toString();
+  const authorizationPage = await fetch(authorizationUrl);
+  const authorizationHtml = await authorizationPage.text();
+  if (!authorizationPage.ok) throw new Error(`OAuth authorization page failed (${authorizationPage.status}): ${authorizationHtml}`);
+  const csrfToken = authorizationHtml.match(/name="csrf_token" value="([^"]+)"/)?.[1];
+  if (!csrfToken) throw new Error('OAuth authorization form did not include its CSRF token.');
+  const authorizationResponse = await fetch(metadata.authorization_endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    redirect: 'manual',
+    body: new URLSearchParams({ ...Object.fromEntries(authParams), csrf_token: csrfToken, password: authPassword }),
+  });
+  const callback = authorizationResponse.headers.get('location');
+  if (authorizationResponse.status !== 302 || !callback) {
+    throw new Error(`OAuth password authorization failed (${authorizationResponse.status}): ${await authorizationResponse.text()}`);
+  }
+  const code = new URL(callback).searchParams.get('code');
+  if (!code) throw new Error('OAuth authorization redirect did not include a code.');
+  const tokenResponse = await fetch(metadata.token_endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: registeredClient.client_id,
+      code,
+      code_verifier: verifier,
+      redirect_uri: callbackUrl,
+      resource: resourceUrl.href,
+    }),
+  });
+  const tokenText = await tokenResponse.text();
+  if (!tokenResponse.ok) throw new Error(`OAuth token exchange failed (${tokenResponse.status}): ${tokenText}`);
+  return JSON.parse(tokenText).access_token;
+}
+
+const accessToken = await obtainSmokeToken();
+const transport = new StreamableHTTPClientTransport(endpoint, {
+  requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
+});
 
 async function docker(args, options = {}) {
   return execFileAsync('docker', ['--host', dockerHost, ...args], {

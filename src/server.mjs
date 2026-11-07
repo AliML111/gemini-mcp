@@ -12,6 +12,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import { createMcpOAuthSecurity } from './mcp-oauth.mjs';
 
 const execFileAsync = promisify(execFile);
 const port = Number.parseInt(process.env.MCP_PORT ?? '8787', 10);
@@ -93,6 +94,12 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 if (!endpointPath.startsWith('/') || endpointPath.includes('?') || endpointPath.includes('#')) {
   throw new Error('MCP_PATH must be an absolute URL path.');
 }
+const oauthSecurity = createMcpOAuthSecurity({
+  publicUrl: process.env.MCP_PUBLIC_URL,
+  password: process.env.MCP_AUTH_PASSWORD,
+  endpointPath,
+});
+const projectNetworkAccessAllowed = process.env.MCP_PROJECT_ALLOW_NETWORK === 'true';
 for (const [lifecycle, policy] of Object.entries(workspaceLifecyclePolicies)) {
   if (!Number.isSafeInteger(policy.idleTtlMs) || policy.idleTtlMs < 1_000
     || !Number.isSafeInteger(policy.maxLifetimeMs) || policy.maxLifetimeMs < policy.idleTtlMs) {
@@ -739,7 +746,7 @@ function createServer() {
     instructions.push(`Filesystem tools are confined to these configured roots: ${filesystemBackend.roots.join(', ')}. Use list_files, read_file, or search_files to inspect; write_file and edit_file can change files only inside these roots. Reads and search results have size limits.`);
   }
   if (projectWorkflow) {
-    instructions.push('For a configured web project, create a start_project_session first. It snapshots source into a managed no-host-mount gVisor workspace; the workspace is shared by run_project_checks and start_project_preview, so dependencies and build output persist during the workflow. The snapshot excludes .git, node_modules, environment files, build output, caches, and common credential directories. Network mode is fixed when the session starts: internal/no-egress by default; internet_access=true selects the rootless bridge and may reach host/LAN services visible to it. Rootless Docker can publish preview ports only for bridge sessions, so install steps that fetch dependencies or a requested browser preview require internet_access=true and therefore allow project code outbound/host-LAN access; get the user’s approval before opting in. Run only configured install/build/test/lint actions. For browser checks, start_project_preview, use the separate Playwright connector to open the returned loopback URL, save a screenshot under the Playwright output directory if a durable image is needed, then call save_review_screenshot and stop_project_preview. Sessions expire after 30 minutes idle or 2 hours total; stop the session when finished. Review artifacts live under .gemini-mcp/reviews/<review_id>/ in the configured project root.');
+    instructions.push('For a configured web project, create a start_project_session first. It snapshots source into a managed no-host-mount gVisor workspace; the workspace is shared by run_project_checks and start_project_preview, so dependencies and build output persist during the workflow. The snapshot excludes .git, node_modules, environment files, build output, caches, and common credential directories, and is capped by entry count, nesting depth, file count, and bytes. Network mode is fixed when the session starts: internal/no-egress by default. internet_access=true is rejected unless the MCP server administrator enabled MCP_PROJECT_ALLOW_NETWORK=true; when enabled it selects the rootless bridge and may reach host/LAN services visible to it. Rootless Docker can publish preview ports only for bridge sessions, so dependency downloads and browser previews require this operator-side network opt-in. Run only configured install/build/test/lint actions. For browser checks, start_project_preview, use the separate Playwright connector to open the returned loopback URL, save a screenshot under the Playwright output directory if a durable image is needed, then call save_review_screenshot and stop_project_preview. Sessions expire after 30 minutes idle or 2 hours total; stop the session when finished. Review artifacts live under .gemini-mcp/reviews/<review_id>/ in the configured project root.');
   }
   instructions.push('Never include secrets in commands. Gemini approval preferences are controlled by Gemini Connected Apps, not by this MCP server.');
   const server = new McpServer(
@@ -977,7 +984,7 @@ function createServer() {
       'start_project_session',
       {
         title: 'Start an isolated project workspace',
-        description: 'Copies a configured project snapshot into a managed gVisor workspace with no host mounts. The workspace persists build outputs and dependencies for later checks and preview. Network defaults to internal/no-egress. internet_access=true gives the whole session rootless-bridge access, which may reach host/LAN services; this is required for dependency downloads and browser preview port publishing in this rootless Docker setup. The session lasts up to 30 minutes idle or 2 hours total and has 512 MiB memory, 0.5 CPU, 128 tasks, and a 384 MiB workspace.',
+        description: 'Copies a configured project snapshot into a managed gVisor workspace with no host mounts. The workspace persists build outputs and dependencies for later checks and preview. Snapshot traversal is capped by entry count, nesting depth, file count, and bytes. Network defaults to internal/no-egress. internet_access=true is rejected unless the MCP server administrator enabled MCP_PROJECT_ALLOW_NETWORK=true; when enabled it gives the whole session rootless-bridge access, which may reach host/LAN services; this is required for dependency downloads and browser preview port publishing in this rootless Docker setup. The session lasts up to 30 minutes idle or 2 hours total and has 512 MiB memory, 0.5 CPU, 128 tasks, and a 384 MiB workspace.',
         inputSchema: { project_id: projectIdSchema, internet_access: z.boolean().default(false), review_id: z.string().uuid().optional() },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       },
@@ -1004,7 +1011,7 @@ function createServer() {
       'start_project_preview',
       {
         title: 'Start a temporary local preview',
-        description: 'Starts the configured preview command inside the project session using its existing dependencies and build output. The project session must have been created with internet_access=true because rootless Docker can publish ports only from its bridge network; that grants the whole project session outbound and possible host/LAN access. The configured port is published only on a random 127.0.0.1 host port for local Playwright. Returns when HTTP responds or after a 30-second readiness timeout.',
+        description: 'Starts the configured preview command inside the project session using its existing dependencies and build output. The project session must have been created with internet_access=true, which is available only when the MCP server administrator enabled MCP_PROJECT_ALLOW_NETWORK=true. Rootless Docker can publish ports only from its bridge network; that grants the whole project session outbound and possible host/LAN access. The configured port is published only on a random 127.0.0.1 host port for local Playwright. Returns when HTTP responds or after a 30-second readiness timeout.',
         inputSchema: { project_id: projectIdSchema, session_id: sessionIdSchema, review_id: z.string().uuid().optional() },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
       },
@@ -1167,8 +1174,10 @@ app.use((req, res, next) => {
   res.on('finish', () => console.log(`HTTP status=${res.statusCode}`));
   next();
 });
+app.use(oauthSecurity.router);
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'gemini-local-bash-poc', backends: enabledBackends }));
 
+app.use(endpointPath, oauthSecurity.requireAuthentication);
 app.post(endpointPath, async (req, res) => {
   if (!consumeToolCallRateLimit(req.body)) {
     return res.status(429).json({
@@ -1263,7 +1272,7 @@ async function start() {
   if (requestedBackends.includes('project')) {
     await ensureProjectBackend();
     const profiles = await loadProjectProfiles();
-    projectWorkflow = new ProjectWorkflow({ docker, dockerInput, profiles });
+    projectWorkflow = new ProjectWorkflow({ docker, dockerInput, profiles, allowNetworkAccess: projectNetworkAccessAllowed });
     await projectWorkflow.initialize();
     enabledBackends.push('project');
   }
@@ -1301,6 +1310,7 @@ async function start() {
 
   app.listen(port, '127.0.0.1', () => {
     console.log(`MCP PoC listening on http://127.0.0.1:${port}${endpointPath}`);
+    console.log(`OAuth 2.1/PKCE protection enabled for ${oauthSecurity.resourceUrl.href}. Restart after changing MCP_PUBLIC_URL or MCP_AUTH_PASSWORD.`);
     console.log(`Detected and enabled backends: ${enabledBackends.join(', ')}.`);
     if (enabledBackends.includes('docker')) {
       console.log(`Sandbox Docker daemon: ${sandboxDockerHost} (rootless; runtime=${sandboxRuntime})`);
@@ -1308,13 +1318,13 @@ async function start() {
       console.log(`Workspace policy: max ${maxSandboxWorkspaces}; ephemeral workspaces are deleted after a batch; conversation TTL is ${Math.round(workspaceIdleTtlMs / 60_000)}m idle/${Math.round(workspaceMaxLifetimeMs / 60_000)}m total; task TTL is ${Math.round(taskWorkspaceIdleTtlMs / 60_000)}m idle/${Math.round(taskWorkspaceMaxLifetimeMs / 60_000)}m total; SQLite=${stateDbPath}.`);
     }
     if (hostShellExecutables.size > 0) {
-      console.warn('Host shell backends execute with the MCP server user’s full local permissions. Do not expose this endpoint through an unauthenticated public tunnel.');
+      console.warn('Host shell backends execute with the MCP server user’s full local permissions. Only connect trusted Gemini users.');
     }
     if (filesystemBackend) {
-      console.warn(`Filesystem backend is enabled for: ${filesystemBackend.roots.join(', ')}. Gemini can read and write files in these roots; do not expose this endpoint through an unauthenticated public tunnel.`);
+      console.warn(`Filesystem backend is enabled for: ${filesystemBackend.roots.join(', ')}. OAuth-authorized Gemini clients can read and write files in these roots.`);
     }
     if (projectWorkflow) {
-      console.log(`Project workflow is enabled for configured aliases: ${projectWorkflow.listProjects().map((project) => project.id).join(', ')}. Source runs only from snapshots inside gVisor; preview ports bind to 127.0.0.1 and require an explicitly networked session.`);
+      console.log(`Project workflow is enabled for configured aliases: ${projectWorkflow.listProjects().map((project) => project.id).join(', ')}. Source runs only from bounded snapshots inside gVisor; project network access is ${projectNetworkAccessAllowed ? 'operator-enabled' : 'disabled'}; preview ports bind to 127.0.0.1.`);
     }
   });
 }

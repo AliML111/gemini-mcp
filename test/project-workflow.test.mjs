@@ -17,11 +17,12 @@ async function tempDir(t) {
   return path;
 }
 
-function workflow(root, profiles = new Map()) {
+function workflow(root, profiles = new Map(), options = {}) {
   return new ProjectWorkflow({
     docker: async () => ({ stdout: '' }),
     dockerInput: async () => ({ stdout: '' }),
     profiles: profiles.size ? profiles : new Map([['demo', { id: 'demo', name: 'Demo', root, commands: {}, preview: null }]]),
+    ...options,
   });
 }
 
@@ -34,6 +35,17 @@ test('project snapshots omit credentials, environment files and symlinks but kee
   await writeFile(join(root, 'app.js'), 'safe source\n');
   await writeFile(join(root, '.env.test'), 'FAKE_TOKEN=do-not-copy\n');
   await writeFile(join(root, '.env.example'), 'PUBLIC_SETTING=example\n');
+  await mkdir(join(root, '.env'));
+  await writeFile(join(root, '.env', 'config'), 'DUMMY_ENV_DIRECTORY_SECRET\n');
+  await mkdir(join(root, 'credentials'));
+  await writeFile(join(root, 'credentials', 'token.txt'), 'DUMMY_CREDENTIAL_DIRECTORY_SECRET\n');
+  await mkdir(join(root, 'secret'));
+  await writeFile(join(root, 'secret', 'key.txt'), 'DUMMY_SECRET_DIRECTORY_SECRET\n');
+  await mkdir(join(root, 'docs', '.env.example'), { recursive: true });
+  await writeFile(join(root, 'docs', '.env.example', 'token'), 'DUMMY_EXAMPLE_DIRECTORY_SECRET\n');
+  for (const name of ['id_ecdsa', 'id_dsa', 'id_ed25519_sk', 'id_ecdsa_sk']) {
+    await writeFile(join(root, name), `DUMMY_${name.toUpperCase()}_PRIVATE_KEY\n`);
+  }
   await writeFile(join(root, '.npmrc'), '//registry.example/:_authToken=fake\n');
   await writeFile(join(root, 'service.pem'), 'FAKE_PRIVATE_KEY\n');
   await writeFile(join(root, 'credentials.json'), '{"token":"fake"}\n');
@@ -43,12 +55,44 @@ test('project snapshots omit credentials, environment files and symlinks but kee
   const snapshot = await instance.snapshotProject(root);
   try {
     const files = await readdir(snapshot.directory);
-    assert.deepEqual(files.sort(), ['.env.example', 'app.js']);
+    assert.deepEqual(files.sort(), ['.env.example', 'app.js', 'docs']);
     assert.equal(await readFile(join(snapshot.directory, 'app.js'), 'utf8'), 'safe source\n');
+    for (const path of [
+      '.env/config', 'credentials/token.txt', 'secret/key.txt', 'docs/.env.example/token',
+      'id_ecdsa', 'id_dsa', 'id_ed25519_sk', 'id_ecdsa_sk',
+    ]) {
+      await assert.rejects(readFile(join(snapshot.directory, path)), { code: 'ENOENT' }, `${path} should not enter the snapshot`);
+    }
+    assert.deepEqual(await readdir(join(snapshot.directory, 'docs')), [], 'a .env.example directory is not the example file');
+    assert.equal(await readFile(join(snapshot.directory, '.env.example'), 'utf8'), 'PUBLIC_SETTING=example\n');
     await assert.rejects(lstat(join(snapshot.directory, 'source-link.js')), { code: 'ENOENT' });
+    assert.ok(snapshot.totalEntries >= 16, 'directory entries, including filtered and empty directories, are counted');
   } finally {
     await rm(snapshot.directory, { recursive: true, force: true });
   }
+});
+
+test('project snapshots cap total directory entries and nesting depth', async (t) => {
+  const entriesRoot = await tempDir(t);
+  for (let index = 0; index < 8; index += 1) await mkdir(join(entriesRoot, `empty-${index}`));
+  const entryLimited = workflow(entriesRoot, new Map(), { snapshotLimits: { maxEntries: 5 } });
+  await assert.rejects(entryLimited.snapshotProject(entriesRoot), /5 total directory entries/);
+
+  const depthRoot = await tempDir(t);
+  await mkdir(join(depthRoot, 'one', 'two', 'three'), { recursive: true });
+  const depthLimited = workflow(depthRoot, new Map(), { snapshotLimits: { maxDepth: 2 } });
+  await assert.rejects(depthLimited.snapshotProject(depthRoot), /maximum directory depth 2/);
+});
+
+test('project network access requires an administrator-side opt-in', async (t) => {
+  const root = await tempDir(t);
+  const blocked = workflow(root);
+  await assert.rejects(
+    blocked.createProjectSession({ project_id: 'demo', internet_access: true }),
+    /MCP_PROJECT_ALLOW_NETWORK=true/,
+  );
+  assert.equal(blocked.pendingSessions, 0);
+  assert.equal(blocked.sessions.size, 0);
 });
 
 test('review diff includes regular source files and excludes secrets and untracked symlinks', async (t) => {

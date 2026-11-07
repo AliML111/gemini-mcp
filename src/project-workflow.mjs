@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import {
-  chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile, rename,
+  chmod, copyFile, lstat, mkdir, mkdtemp, opendir, readFile, readdir, realpath, rm, stat, writeFile, rename,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -20,6 +20,8 @@ const maxCommandOutputBytes = 64 * 1024;
 const maxDiffBytes = 512 * 1024;
 const maxSnapshotBytes = 256 * 1024 * 1024;
 const maxSnapshotFiles = 30_000;
+const maxSnapshotEntries = 30_000;
+const maxSnapshotDepth = 64;
 const previewTtlMs = 30 * 60 * 1000;
 const sessionMaxLifetimeMs = 2 * 60 * 60 * 1000;
 const maxProjectSessions = 2;
@@ -54,12 +56,12 @@ function safeArtifactName(value) {
 
 function sensitivePath(path, { allowExampleEnv = false } = {}) {
   const components = path.split(/[\\/]/).filter(Boolean);
-  return components.some((name) => {
-    if (allowExampleEnv && name === '.env.example') return false;
+  return components.some((name, index) => {
+    if (allowExampleEnv && index === components.length - 1 && name === '.env.example') return false;
     return /^\.env(?:\..*)?$/i.test(name)
       || excludedFiles.has(name.toLowerCase())
       || /^credentials?\.(?:json|ya?ml|toml|txt)$/i.test(name)
-      || /^id_(?:rsa|ed25519)(?:\..*)?$/i.test(name)
+      || /^id_(?:rsa|dsa|ecdsa|ed25519|ed448)(?:_sk)?(?:\..*)?$/i.test(name)
       || /\.(?:pem|key|p12|pfx)$/i.test(name);
   });
 }
@@ -165,13 +167,30 @@ export async function loadProjectProfiles(raw = process.env.MCP_PROJECTS_JSON) {
 }
 
 export class ProjectWorkflow {
-  constructor({ docker, dockerInput, profiles, playwrightOutputRoot = process.env.MCP_PLAYWRIGHT_OUTPUT_ROOT ?? '/tmp/gemini-mcp-playwright-output' }) {
+  constructor({
+    docker,
+    dockerInput,
+    profiles,
+    playwrightOutputRoot = process.env.MCP_PLAYWRIGHT_OUTPUT_ROOT ?? '/tmp/gemini-mcp-playwright-output',
+    snapshotLimits = {},
+    allowNetworkAccess = false,
+  }) {
     if (typeof docker !== 'function' || typeof dockerInput !== 'function' || !(profiles instanceof Map) || profiles.size === 0) {
       throw new Error('ProjectWorkflow requires Docker commands, streamed Docker input, and configured project profiles.');
     }
     this.docker = docker;
     this.dockerInput = dockerInput;
     this.profiles = profiles;
+    this.snapshotLimits = {
+      maxBytes: snapshotLimits.maxBytes ?? maxSnapshotBytes,
+      maxFiles: snapshotLimits.maxFiles ?? maxSnapshotFiles,
+      maxEntries: snapshotLimits.maxEntries ?? maxSnapshotEntries,
+      maxDepth: snapshotLimits.maxDepth ?? maxSnapshotDepth,
+    };
+    if (Object.values(this.snapshotLimits).some((limit) => !Number.isSafeInteger(limit) || limit < 1)) {
+      throw new Error('Project snapshot limits must be positive safe integers.');
+    }
+    this.allowNetworkAccess = allowNetworkAccess === true;
     this.sessions = new Map();
     this.pendingSessions = 0;
     this.activeChecks = 0;
@@ -262,33 +281,43 @@ export class ProjectWorkflow {
     const directory = await mkdtemp(join(tmpdir(), 'gemini-mcp-project-'));
     let totalBytes = 0;
     let totalFiles = 0;
-    const skipFile = (name) => sensitivePath(name, { allowExampleEnv: true });
-    const visit = async (source, target) => {
-      const entries = await readdir(source, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory() && excludedDirectories.has(entry.name)) continue;
-        if (entry.isFile() && skipFile(entry.name)) continue;
-        const from = join(source, entry.name);
-        const to = join(target, entry.name);
-        if (entry.isDirectory()) {
-          await mkdir(to, { mode: 0o700 });
-          await visit(from, to);
-        } else if (entry.isFile()) {
-          const info = await lstat(from);
-          totalFiles += 1;
-          totalBytes += info.size;
-          if (totalFiles > maxSnapshotFiles || totalBytes > maxSnapshotBytes) {
-            throw new Error(`Project snapshot exceeds ${maxSnapshotFiles} files or ${Math.round(maxSnapshotBytes / 1024 / 1024)} MiB.`);
+    let totalEntries = 0;
+    const { maxBytes, maxFiles, maxEntries, maxDepth } = this.snapshotLimits;
+    const visit = async (source, target, depth = 0) => {
+      const dir = await opendir(source);
+      try {
+        for await (const entry of dir) {
+          totalEntries += 1;
+          if (totalEntries > maxEntries) {
+            throw new Error(`Project snapshot exceeds ${maxEntries} total directory entries.`);
           }
-          await copyFile(from, to);
-          await chmod(to, info.mode & 0o755);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory() && (excludedDirectories.has(entry.name) || sensitivePath(entry.name))) continue;
+          if (entry.isFile() && sensitivePath(entry.name, { allowExampleEnv: true })) continue;
+          const from = join(source, entry.name);
+          const to = join(target, entry.name);
+          if (entry.isDirectory()) {
+            if (depth >= maxDepth) throw new Error(`Project snapshot exceeds maximum directory depth ${maxDepth}.`);
+            await mkdir(to, { mode: 0o700 });
+            await visit(from, to, depth + 1);
+          } else if (entry.isFile()) {
+            const info = await lstat(from);
+            totalFiles += 1;
+            totalBytes += info.size;
+            if (totalFiles > maxFiles || totalBytes > maxBytes) {
+              throw new Error(`Project snapshot exceeds ${maxFiles} files or ${Math.round(maxBytes / 1024 / 1024)} MiB.`);
+            }
+            await copyFile(from, to);
+            await chmod(to, info.mode & 0o755);
+          }
         }
+      } finally {
+        await dir.close().catch(() => {});
       }
     };
     try {
       await visit(root, directory);
-      return { directory, totalBytes, totalFiles };
+      return { directory, totalBytes, totalFiles, totalEntries };
     } catch (error) {
       await rm(directory, { recursive: true, force: true });
       throw error;
@@ -326,6 +355,9 @@ export class ProjectWorkflow {
   }
 
   async createProjectSession({ project_id: projectId, internet_access: internetAccess = false, review_id: reviewId = null }) {
+    if (internetAccess && !this.allowNetworkAccess) {
+      throw new Error('Project network access is disabled by the MCP server administrator. Set MCP_PROJECT_ALLOW_NETWORK=true to allow internet_access=true.');
+    }
     const profile = this.project(projectId);
     await this.cleanupExpiredSessions();
     if (this.sessions.size + this.pendingSessions >= maxProjectSessions) throw new Error(`At most ${maxProjectSessions} project sessions can run at once.`);
