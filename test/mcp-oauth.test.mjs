@@ -81,12 +81,16 @@ test('OAuth requires the server password, PKCE, and issues a resource-bound MCP 
   const originalForm = await authorizationPage.text();
   const firstCsrfToken = readCsrf(originalForm);
 
-  const submitAuthorization = (csrfToken, password) => fetch(`${baseUrl}/authorize`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    redirect: 'manual',
-    body: new URLSearchParams({ ...authParams, csrf_token: csrfToken, password }),
-  });
+  const submitAuthorization = (csrfToken, password, capabilities = ['sandbox:execute']) => {
+    const body = new URLSearchParams({ ...authParams, csrf_token: csrfToken, password });
+    for (const capability of capabilities) body.append('capabilities', capability);
+    return fetch(`${baseUrl}/authorize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      redirect: 'manual',
+      body,
+    });
+  };
   const forgedAuthorization = await submitAuthorization('forged-csrf-token', accessPassword);
   assert.equal(forgedAuthorization.status, 400, 'authorization cannot be submitted without its issued CSRF token');
   const rejectedPassword = await submitAuthorization(firstCsrfToken, 'wrong-password');
@@ -122,6 +126,8 @@ test('OAuth requires the server password, PKCE, and issues a resource-bound MCP 
   const tokens = JSON.parse(tokenBody);
   assert.equal(tokens.token_type, 'bearer');
   assert.equal(tokens.scope, 'mcp:tools');
+  assert.deepEqual(security.provider.capabilitiesForToken(tokens.access_token), ['sandbox:execute']);
+  assert.equal(security.provider.capabilitiesForToken('invalid-token').length, 0);
 
   const authorized = await fetch(`${baseUrl}/mcp`, {
     method: 'POST',
@@ -154,10 +160,31 @@ test('OAuth requires the server password, PKCE, and issues a resource-bound MCP 
   assert.equal(refreshedResponse.status, 200, refreshedBody);
   const refreshed = JSON.parse(refreshedBody);
   assert.notEqual(refreshed.refresh_token, tokens.refresh_token, 'refresh tokens rotate on use');
+  assert.deepEqual(security.provider.capabilitiesForToken(refreshed.access_token), ['sandbox:execute'],
+    'refresh must retain the original granted capabilities, never broaden them');
 });
 
 test('OAuth configuration rejects insecure or mismatched public MCP URLs and weak passwords', () => {
   assert.throws(() => createMcpOAuthSecurity({ publicUrl: 'http://mcp.example.test/mcp', password: accessPassword }), /HTTPS/);
   assert.throws(() => createMcpOAuthSecurity({ publicUrl: 'https://mcp.example.test/other', password: accessPassword }), /MCP_PATH/);
   assert.throws(() => createMcpOAuthSecurity({ publicUrl: resourceUrl, password: 'too-short' }), /32 UTF-8 bytes/);
+});
+
+test('dynamic client registration is rate-limited to prevent unbounded registration', async (t) => {
+  const { baseUrl } = await startTestServer(t);
+  for (let i = 0; i < 10; i += 1) {
+    await registerClient(baseUrl);
+  }
+  const denied = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'Registration flood',
+      redirect_uris: ['https://client.example.test/callback'],
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+    }),
+  });
+  assert.ok(denied.status >= 400 && denied.status < 500, 'registration flood must be rejected');
 });
