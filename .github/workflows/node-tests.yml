@@ -2,9 +2,6 @@ name: Node tests
 
 on:
   push:
-    branches:
-      - main
-      - security/**
   pull_request:
 
 permissions:
