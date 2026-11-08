@@ -1180,7 +1180,7 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'gemini-local-ba
 
 app.use(endpointPath, oauthSecurity.requireAuthentication);
 app.post(endpointPath, async (req, res) => {
-  const bearer = /^Bearer (\\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
   const capabilities = bearer ? oauthSecurity.provider.capabilitiesForToken(bearer) : [];
   const denied = deniedToolCall(req.body, capabilities);
   if (denied) {
