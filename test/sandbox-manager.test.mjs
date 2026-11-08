@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { SandboxManager } from '../src/sandbox-manager.mjs';
 
 function fakeContainer(name, labels, id = randomUUID()) {
@@ -265,4 +266,44 @@ test('failed database initialization releases owner lock for a retry', async (t)
   await retry.open();
   t.after(() => retry.close());
   assert.deepEqual(retry.list(), []);
+});
+
+test('kernel lock is released after abrupt owner-process death', async (t) => {
+  const { manager, createManager, dbPath } = await fixture(t);
+  await manager.close();
+  const source = [
+    "import { RegistryOwnerLock } from " + JSON.stringify(new URL('../src/registry-owner-lock.mjs', import.meta.url).href) + ";",
+    "const lock = new RegistryOwnerLock(process.argv[1]);",
+    "await lock.acquire();",
+    "process.stdout.write('READY\\n');",
+    "setInterval(() => {}, 60000);",
+  ].join('\n');
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source, `${dbPath}.owner.lock`], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  await new Promise((resolve, reject) => {
+    let output = '';
+    const timeout = setTimeout(() => reject(new Error('lock subprocess did not start')), 5000);
+    child.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+      if (output.includes('READY\n')) { clearTimeout(timeout); resolve(); }
+    });
+    child.once('error', (error) => { clearTimeout(timeout); reject(error); });
+    child.once('exit', (code) => { clearTimeout(timeout); reject(new Error(`child exited early: ${code}`)); });
+  });
+  const contender = createManager();
+  await assert.rejects(contender.open(), /already owned by another MCP process/);
+  child.kill('SIGKILL');
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      await contender.open();
+      t.after(() => contender.close());
+      assert.deepEqual(contender.list(), []);
+      return;
+    } catch (error) {
+      if (!/already owned/.test(error.message) || attempt === 29) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 });
