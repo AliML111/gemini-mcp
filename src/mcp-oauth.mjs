@@ -45,10 +45,19 @@ function escapeHtml(value) {
   })[character]);
 }
 
-function setAuthorizationPageHeaders(res) {
+function authorizationFormFingerprint(body) {
+  const normalized = Object.entries(body ?? {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => [name, Array.isArray(value) ? [...value] : value]);
+  return createHash('sha256').update(JSON.stringify(normalized)).digest();
+}
+
+function setAuthorizationPageHeaders(res, nonce) {
   res.set({
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    // Omit form-action: browsers enforce it across OAuth 302 redirect chains,
+    // while this page's only form has a fixed same-origin /authorize action.
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline';${nonce ? ` script-src 'nonce-${nonce}';` : ''} base-uri 'none'; frame-ancestors 'none'`,
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
   });
@@ -62,6 +71,7 @@ class PasswordOAuthProvider {
     this.clientRegistrations = new Map();
     this.registrationTimes = [];
     this.authorizationRequests = new Map();
+    this.completedAuthorizationRequests = new Map();
     this.codes = new Map();
     this.accessTokens = new Map();
     this.refreshTokens = new Map();
@@ -96,6 +106,9 @@ class PasswordOAuthProvider {
     }
     for (const [key, value] of this.authorizationRequests) {
       if (value.expiresAt <= now) this.authorizationRequests.delete(key);
+    }
+    for (const [key, value] of this.completedAuthorizationRequests) {
+      if (value.expiresAt <= now) this.completedAuthorizationRequests.delete(key);
     }
     for (const [key, value] of this.codes) {
       if (value.expiresAt <= now) this.codes.delete(key);
@@ -135,12 +148,14 @@ class PasswordOAuthProvider {
     const capabilityCheckboxes = capabilityChoices.map(({ id, label }) =>
       `<label><input type="checkbox" name="capabilities" value="${escapeHtml(id)}"${id === 'sandbox:execute' ? ' checked' : ''}> ${escapeHtml(label)}</label>`
     ).join('');
-    setAuthorizationPageHeaders(res);
+    const pageNonce = randomBytes(18).toString('base64url');
+    setAuthorizationPageHeaders(res, pageNonce);
     res.status(message ? 401 : 200).type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize MCP access</title>
 <style>body{font:16px system-ui,sans-serif;max-width:34rem;margin:10vh auto;padding:0 1rem;color:#18212b}main{border:1px solid #ccd3dc;border-radius:12px;padding:1.5rem}label{display:block;margin:.8rem 0 .3rem}input{box-sizing:border-box;width:100%;padding:.7rem;font:inherit}button{margin-top:1rem;padding:.7rem 1rem;font:inherit}</style></head>
 <body><main><h1>Authorize MCP access</h1><p><strong>${clientName}</strong> requests access to this MCP server.</p><p>Access includes: ${scopeLabel}</p>${error}
-<form method="post" action="/authorize">${fields}<fieldset><legend>Grant only the capabilities this client needs</legend>${capabilityCheckboxes}</fieldset><label for="password">Server access password</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button type="submit">Authorize</button></form></main></body></html>`);
+<form id="authorize-form" method="post" action="/authorize">${fields}<fieldset><legend>Grant only the capabilities this client needs</legend>${capabilityCheckboxes}</fieldset><label for="password">Server access password</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button id="authorize-button" type="submit">Authorize</button></form><p id="authorize-status" aria-live="polite"></p></main>
+<script nonce="${pageNonce}">document.getElementById('authorize-form').addEventListener('submit', () => { const button = document.getElementById('authorize-button'); button.disabled = true; button.textContent = 'Authorizing…'; document.getElementById('authorize-status').textContent = 'Please wait while Gemini connects.'; });</script></body></html>`);
   }
 
   async authorize(client, params, res) {
@@ -157,6 +172,20 @@ class PasswordOAuthProvider {
     }
     const body = res.req.body ?? {};
     const csrfToken = typeof body.csrf_token === 'string' ? body.csrf_token : '';
+    const formFingerprint = authorizationFormFingerprint(body);
+    const completedRequest = this.completedAuthorizationRequests.get(csrfToken);
+    if (completedRequest) {
+      if (completedRequest.clientId === client.client_id
+        && timingSafeEqual(completedRequest.formFingerprint, formFingerprint)) {
+        if (completedRequest.codeRedeemed) {
+          setAuthorizationPageHeaders(res);
+          res.status(200).type('text').send('Authorization already completed. Return to Gemini.');
+        } else {
+          res.redirect(302, completedRequest.redirectUrl);
+        }
+        return;
+      }
+    }
     const authorizationRequest = this.authorizationRequests.get(csrfToken);
     if (!authorizationRequest || authorizationRequest.expiresAt <= Date.now()) {
       this.authorizationRequests.delete(csrfToken);
@@ -210,6 +239,14 @@ class PasswordOAuthProvider {
     const redirect = new URL(params.redirectUri);
     redirect.searchParams.set('code', code);
     if (params.state !== undefined) redirect.searchParams.set('state', params.state);
+    this.completedAuthorizationRequests.set(csrfToken, {
+      clientId: client.client_id,
+      formFingerprint,
+      redirectUrl: redirect.href,
+      code,
+      codeRedeemed: false,
+      expiresAt: Date.now() + authorizationCodeTtlMs,
+    });
     res.redirect(302, redirect.href);
   }
 
@@ -229,6 +266,9 @@ class PasswordOAuthProvider {
       throw new InvalidGrantError('Authorization code does not match this redirect or resource.');
     }
     this.codes.delete(authorizationCode);
+    for (const completedRequest of this.completedAuthorizationRequests.values()) {
+      if (completedRequest.code === authorizationCode) completedRequest.codeRedeemed = true;
+    }
     return this.issueTokens(client.client_id, code.params.scopes, this.resourceUrl, code.capabilities);
   }
 

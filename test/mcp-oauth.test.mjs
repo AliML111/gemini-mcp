@@ -77,8 +77,13 @@ test('OAuth requires the server password, PKCE, and issues a resource-bound MCP 
   authorizationUrl.search = new URLSearchParams(authParams);
   const authorizationPage = await fetch(authorizationUrl);
   assert.equal(authorizationPage.status, 200);
-  assert.match(authorizationPage.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  const authorizationCsp = authorizationPage.headers.get('content-security-policy');
+  assert.match(authorizationCsp, /frame-ancestors 'none'/);
+  assert.match(authorizationCsp, /script-src 'nonce-/);
+  assert.doesNotMatch(authorizationCsp, /(?:^|;)\s*form-action(?:\s|;|$)/);
   const originalForm = await authorizationPage.text();
+  assert.match(originalForm, /<form id="authorize-form" method="post" action="\/authorize">/);
+  assert.match(originalForm, /button\.disabled = true/);
   const firstCsrfToken = readCsrf(originalForm);
 
   const submitAuthorization = (csrfToken, password, capabilities = ['sandbox:execute']) => {
@@ -99,6 +104,11 @@ test('OAuth requires the server password, PKCE, and issues a resource-bound MCP 
   assert.match(retryPage, /password was not accepted/i);
   const accepted = await submitAuthorization(readCsrf(retryPage), accessPassword);
   assert.equal(accepted.status, 302);
+  const acceptedAgain = await submitAuthorization(readCsrf(retryPage), accessPassword);
+  assert.equal(acceptedAgain.status, 302, 'a duplicate submission of the same successful authorization is idempotent');
+  assert.equal(acceptedAgain.headers.get('location'), accepted.headers.get('location'));
+  const alteredReplay = await submitAuthorization(readCsrf(retryPage), accessPassword, []);
+  assert.equal(alteredReplay.status, 400, 'a replay with changed capabilities is rejected');
   const callback = new URL(accepted.headers.get('location'));
   assert.equal(callback.origin + callback.pathname, redirectUri);
   assert.equal(callback.searchParams.get('state'), 'state-value');
@@ -128,6 +138,9 @@ test('OAuth requires the server password, PKCE, and issues a resource-bound MCP 
   assert.equal(tokens.scope, 'mcp:tools');
   assert.deepEqual(security.provider.capabilitiesForToken(tokens.access_token), ['sandbox:execute']);
   assert.equal(security.provider.capabilitiesForToken('invalid-token').length, 0);
+  const completedReplay = await submitAuthorization(readCsrf(retryPage), accessPassword);
+  assert.equal(completedReplay.status, 200, 'a duplicate submission after token exchange does not show an expired-form error');
+  assert.match(await completedReplay.text(), /already completed/i);
 
   const authorized = await fetch(`${baseUrl}/mcp`, {
     method: 'POST',
