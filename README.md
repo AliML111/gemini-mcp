@@ -202,6 +202,20 @@ Each authenticated tool request is checked server-side against the capabilities 
 
 **Compatibility:** existing Gemini clients must reconnect after installing this version. If a needed tool returns HTTP 403, reauthorize and select its capability; never disable authorization as a workaround. Be especially careful with host and filesystem write grants. Host-shell tools remain unsandboxed even when accessed through OAuth. These controls protect the MCP entrypoint, not commands manually run outside the server.
 
+### Structured execution audit
+
+The MCP server writes an append-only JSON Lines audit by default to `$XDG_STATE_HOME/gemini-mcp/execution-audit.jsonl` (or `$HOME/.local/state/gemini-mcp/execution-audit.jsonl` when unset). Set `MCP_AUDIT_LOG` to an absolute path to use another destination.
+
+Audit events include a correlation UUID, a truncated one-way client-ID fingerprint, tool name, capability, start/finish/denial, duration, network opt-in flag, batch size, and available exit/timeout status. Schema: `gemini-mcp.audit.v1`. **Raw commands, file paths, file contents, tool arguments, bearer tokens and tool output are not recorded.**
+
+The server refuses to start without a private (0600) audit file, and refuses a new tool invocation when the start event cannot be persisted. A write failure after command execution cannot undo the action. These JSONL records are operational audits, not a tamper-evident ledger. Keep logs private; establish retention and collection controls. Restart the service after log rotation because the file handle remains open. Logs are not automatically purged.
+
+### SQLite single-instance ownership
+
+The Docker workspace registry now acquires an exclusive kernel-backed `flock(1)` lock at `<SANDBOX_STATE_DB>.owner.lock` **before** opening the SQLite database or reconciling containers. A second process with the same state path fails startup. The lock is held by a helper process connected to the owner through stdin and automatically releases when its process exits, including after a crash.
+
+**Never delete the lock file to free the registry.** The inode is intentionally persistent. The owner-lock helper requires Linux and util-linux `flock`. This is a single-host file lock, not a distributed lease: do not share the database on an unreliable filesystem or run multiple servers against the same Docker daemon with different registry paths.
+
 ### Local SQLite workspace manager
 
 The workspace registry is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/gemini-mcp/sandboxes.sqlite` by default. Override with an **absolute** path, e.g.:
