@@ -9,7 +9,7 @@ const tool = (name, args = {}) => ({
 test('all registered MCP tools have a declared capability', async () => {
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('../src/server.mjs', import.meta.url), 'utf8');
-  const names = [...source.matchAll(/server\\.registerTool\\(\\s*'([^']+)'/g)].map((match) => match[1]);
+  const names = [...source.matchAll(/server\.registerTool\(\s*'([^']+)'/g)].map((match) => match[1]);
   assert.ok(names.length >= 20);
   assert.deepEqual(names.filter((name) => !toolCapabilities[name]), []);
   assert.deepEqual(Object.keys(toolCapabilities).filter((name) => !names.includes(name)), []);
