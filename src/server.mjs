@@ -13,6 +13,7 @@ import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { createMcpOAuthSecurity } from './mcp-oauth.mjs';
+import { deniedToolCall } from './tool-capabilities.mjs';
 
 const execFileAsync = promisify(execFile);
 const port = Number.parseInt(process.env.MCP_PORT ?? '8787', 10);
@@ -1179,6 +1180,17 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'gemini-local-ba
 
 app.use(endpointPath, oauthSecurity.requireAuthentication);
 app.post(endpointPath, async (req, res) => {
+  const bearer = /^Bearer (\\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const capabilities = bearer ? oauthSecurity.provider.capabilitiesForToken(bearer) : [];
+  const denied = deniedToolCall(req.body, capabilities);
+  if (denied) {
+    console.warn(`MCP denied tool=${denied.tool} missingCapability=${denied.capability}`);
+    return res.status(403).json({
+      jsonrpc: '2.0',
+      error: { code: -32003, message: `MCP client is not authorized for capability ${denied.capability}. Reauthorize and explicitly approve this capability.` },
+      id: Array.isArray(req.body) ? null : req.body?.id ?? null,
+    });
+  }
   if (!consumeToolCallRateLimit(req.body)) {
     return res.status(429).json({
       jsonrpc: '2.0',
