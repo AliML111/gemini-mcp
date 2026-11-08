@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, chmod } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { RegistryOwnerLock } from './registry-owner-lock.mjs';
 
 const MANAGED_LABEL = 'gemini-mcp-poc.managed=true';
 const WORKSPACE_LABEL = 'gemini-mcp-poc.workspace=true';
@@ -63,6 +64,7 @@ export class SandboxManager {
       throw new Error('SandboxManager requires Docker command and container argument functions.');
     }
     this.dbPath = dbPath;
+    this.ownerLock = new RegistryOwnerLock(`${dbPath}.owner.lock`);
     this.docker = docker;
     this.containerArgs = containerArgs;
     this.sandboxImage = sandboxImage;
@@ -77,6 +79,8 @@ export class SandboxManager {
   }
 
   async open() {
+    await this.ownerLock.acquire();
+    try {
     await mkdir(dirname(this.dbPath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(this.dbPath, { timeout: 3000 });
     await chmod(this.dbPath, 0o600);
@@ -107,9 +111,20 @@ export class SandboxManager {
     if (!columns.some((column) => column.name === 'max_lifetime_ms')) {
       this.db.exec(`ALTER TABLE workspaces ADD COLUMN max_lifetime_ms INTEGER NOT NULL DEFAULT ${this.maxLifetimeMs}`);
     }
+    } catch (error) {
+      if (this.db) { this.db.close(); this.db = null; }
+      await this.ownerLock.release();
+      throw error;
+    }
   }
 
-  close() { this.db?.close(); this.db = null; }
+  async close() {
+    try { this.db?.close(); }
+    finally {
+      this.db = null;
+      await this.ownerLock.release();
+    }
+  }
 
   row(id) { return this.db.prepare('SELECT * FROM workspaces WHERE id = ?').get(id); }
   rows() { return this.db.prepare('SELECT * FROM workspaces ORDER BY created_at, id').all(); }
