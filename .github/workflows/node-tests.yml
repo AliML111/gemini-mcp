@@ -1,0 +1,26 @@
+name: Node tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run unit and authentication tests
+        run: npm test
+      - name: Check JavaScript syntax
+        run: |
+          find src test scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check

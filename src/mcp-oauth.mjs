@@ -11,6 +11,19 @@ const refreshTokenTtlMs = 30 * 24 * 60 * 60 * 1000;
 const authorizationCodeTtlMs = 5 * 60 * 1000;
 const authorizationRequestTtlMs = 10 * 60 * 1000;
 const supportedScopes = ['mcp:tools'];
+export const capabilityChoices = [
+  { id: 'sandbox:execute', label: 'Execute isolated sandbox commands' },
+  { id: 'sandbox:network', label: 'Allow sandbox internet/network access' },
+  { id: 'filesystem:read', label: 'Read configured host filesystem roots' },
+  { id: 'filesystem:write', label: 'Modify files inside configured host filesystem roots' },
+  { id: 'project:execute', label: 'Run configured project checks and manage reviews' },
+  { id: 'project:network', label: 'Allow project sessions with outbound network access' },
+  { id: 'host:execute', label: 'Execute arbitrary commands directly on the host' },
+];
+const capabilityIds = new Set(capabilityChoices.map((choice) => choice.id));
+const clientRegistrationTtlMs = 7 * 24 * 60 * 60 * 1000;
+const registrationWindowMs = 15 * 60 * 1000;
+const maxRegistrationsPerWindow = 10;
 
 function sameResource(left, right) {
   try {
@@ -46,22 +59,41 @@ class PasswordOAuthProvider {
     this.passwordDigest = createHash('sha256').update(password, 'utf8').digest();
     this.resourceUrl = resourceUrl;
     this.clients = new Map();
+    this.clientRegistrations = new Map();
+    this.registrationTimes = [];
     this.authorizationRequests = new Map();
     this.codes = new Map();
     this.accessTokens = new Map();
     this.refreshTokens = new Map();
     this.clientsStore = {
-      getClient: async (clientId) => this.clients.get(clientId),
+      getClient: async (clientId) => {
+        this.cleanupExpired();
+        return this.clients.get(clientId);
+      },
       registerClient: async (client) => {
         this.cleanupExpired();
-        if (this.clients.size >= 200) throw new InvalidRequestError('Client registration limit reached.');
+        const now = Date.now();
+        if (this.registrationTimes.length >= maxRegistrationsPerWindow) {
+          throw new InvalidRequestError('Client registration rate limit reached. Retry later.');
+        }
+        if (this.clients.size >= 200) throw new InvalidRequestError('Client registration capacity reached.');
+        if (this.clients.has(client.client_id)) throw new InvalidRequestError('Client ID already registered.');
         this.clients.set(client.client_id, client);
+        this.clientRegistrations.set(client.client_id, now);
+        this.registrationTimes.push(now);
         return client;
       },
     };
   }
 
   cleanupExpired(now = Date.now()) {
+    this.registrationTimes = this.registrationTimes.filter((time) => time > now - registrationWindowMs);
+    for (const [id, createdAt] of this.clientRegistrations) {
+      if (createdAt + clientRegistrationTtlMs <= now) {
+        this.clients.delete(id);
+        this.clientRegistrations.delete(id);
+      }
+    }
     for (const [key, value] of this.authorizationRequests) {
       if (value.expiresAt <= now) this.authorizationRequests.delete(key);
     }
@@ -100,12 +132,15 @@ class PasswordOAuthProvider {
     const clientName = escapeHtml(client.client_name || 'Gemini MCP client');
     const scopeLabel = escapeHtml(params.scopes.length ? params.scopes.join(', ') : 'mcp:tools');
     const error = message ? `<p role="alert">${escapeHtml(message)}</p>` : '';
+    const capabilityCheckboxes = capabilityChoices.map(({ id, label }) =>
+      `<label><input type="checkbox" name="capabilities" value="${escapeHtml(id)}"${id === 'sandbox:execute' ? ' checked' : ''}> ${escapeHtml(label)}</label>`
+    ).join('');
     setAuthorizationPageHeaders(res);
     res.status(message ? 401 : 200).type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize MCP access</title>
 <style>body{font:16px system-ui,sans-serif;max-width:34rem;margin:10vh auto;padding:0 1rem;color:#18212b}main{border:1px solid #ccd3dc;border-radius:12px;padding:1.5rem}label{display:block;margin:.8rem 0 .3rem}input{box-sizing:border-box;width:100%;padding:.7rem;font:inherit}button{margin-top:1rem;padding:.7rem 1rem;font:inherit}</style></head>
 <body><main><h1>Authorize MCP access</h1><p><strong>${clientName}</strong> requests access to this MCP server.</p><p>Access includes: ${scopeLabel}</p>${error}
-<form method="post" action="/authorize">${fields}<label for="password">Server access password</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button type="submit">Authorize</button></form></main></body></html>`);
+<form method="post" action="/authorize">${fields}<fieldset><legend>Grant only the capabilities this client needs</legend>${capabilityCheckboxes}</fieldset><label for="password">Server access password</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button type="submit">Authorize</button></form></main></body></html>`);
   }
 
   async authorize(client, params, res) {
@@ -147,6 +182,14 @@ class PasswordOAuthProvider {
       return;
     }
     this.authorizationRequests.delete(csrfToken);
+    const submittedCapabilities = body.capabilities === undefined ? []
+      : Array.isArray(body.capabilities) ? body.capabilities : [body.capabilities];
+    if (submittedCapabilities.some((item) => typeof item !== 'string' || !capabilityIds.has(item))
+      || new Set(submittedCapabilities).size !== submittedCapabilities.length) {
+      setAuthorizationPageHeaders(res);
+      res.status(400).type('text').send('Invalid capability selection. Restart authorization.');
+      return;
+    }
     const submittedPassword = typeof body.password === 'string' && Buffer.byteLength(body.password) <= 256
       ? body.password
       : '';
@@ -161,6 +204,7 @@ class PasswordOAuthProvider {
     this.codes.set(code, {
       clientId: client.client_id,
       params: { ...params, scopes },
+      capabilities: submittedCapabilities,
       expiresAt: Date.now() + authorizationCodeTtlMs,
     });
     const redirect = new URL(params.redirectUri);
@@ -185,7 +229,7 @@ class PasswordOAuthProvider {
       throw new InvalidGrantError('Authorization code does not match this redirect or resource.');
     }
     this.codes.delete(authorizationCode);
-    return this.issueTokens(client.client_id, code.params.scopes, this.resourceUrl);
+    return this.issueTokens(client.client_id, code.params.scopes, this.resourceUrl, code.capabilities);
   }
 
   async exchangeRefreshToken(client, refreshToken, scopes, resource) {
@@ -200,20 +244,20 @@ class PasswordOAuthProvider {
       throw new InvalidGrantError('Refresh token cannot grant additional scopes.');
     }
     this.refreshTokens.delete(refreshToken);
-    return this.issueTokens(client.client_id, nextScopes, token.resource);
+    return this.issueTokens(client.client_id, nextScopes, token.resource, token.capabilities);
   }
 
-  issueTokens(clientId, scopes, resource) {
+  issueTokens(clientId, scopes, resource, capabilities = []) {
     const now = Date.now();
     const accessToken = randomBytes(32).toString('base64url');
     const refreshToken = randomBytes(32).toString('base64url');
     const accessExpiresAt = now + accessTokenTtlMs;
     const refreshExpiresAt = now + refreshTokenTtlMs;
     this.accessTokens.set(accessToken, {
-      clientId, scopes, resource, expiresAt: accessExpiresAt, refreshToken,
+      clientId, scopes, resource, capabilities: [...capabilities], expiresAt: accessExpiresAt, refreshToken,
     });
     this.refreshTokens.set(refreshToken, {
-      clientId, scopes, resource, expiresAt: refreshExpiresAt,
+      clientId, scopes, resource, capabilities: [...capabilities], expiresAt: refreshExpiresAt,
     });
     return {
       access_token: accessToken,
@@ -222,6 +266,11 @@ class PasswordOAuthProvider {
       refresh_token: refreshToken,
       scope: scopes.join(' '),
     };
+  }
+
+  capabilitiesForToken(token) {
+    this.cleanupExpired();
+    return this.accessTokens.get(token)?.capabilities ?? [];
   }
 
   async verifyAccessToken(token) {

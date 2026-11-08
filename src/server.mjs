@@ -13,6 +13,8 @@ import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { createMcpOAuthSecurity } from './mcp-oauth.mjs';
+import { deniedToolCall, toolCapabilities } from './tool-capabilities.mjs';
+import { ExecutionAudit, auditMetadata, auditResultMetadata, fingerprintClient, newAuditRequestId } from './execution-audit.mjs';
 
 const execFileAsync = promisify(execFile);
 const port = Number.parseInt(process.env.MCP_PORT ?? '8787', 10);
@@ -82,6 +84,8 @@ let workspaceManager = null;
 let workspaceCleanupTimer = null;
 let filesystemBackend = null;
 let projectWorkflow = null;
+const auditPath = process.env.MCP_AUDIT_LOG ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'gemini-mcp', 'execution-audit.jsonl');
+const audit = new ExecutionAudit(auditPath);
 const hostShellExecutables = new Map();
 let enabledBackends = [];
 let activeToolExecutions = 0;
@@ -734,7 +738,7 @@ async function runHostCommands(shell, commands, workingDirectory) {
   }
 }
 
-function createServer() {
+function createServer(auditContext = {}) {
   const instructions = [];
   if (enabledBackends.includes('docker')) {
     instructions.push('For isolated commands, use run_sandbox_bash for one command or run_sandbox_session for up to four commands in one temporary gVisor workspace. The default lifecycle is ephemeral and removes the container after the batch. Choose conversation to retain a session for later calls (15 minutes idle, 60 minutes total) or task for a longer managed workspace (30 minutes idle, 4 hours total); reuse the returned session_id. The server expires and deletes every retained container. Network is off by default; internet_access=true opts a new container into the rootless bridge. Each command is limited to 5 seconds. Managed containers have no host mounts, read-only root, non-root UID, dropped capabilities, no-new-privileges, and per-container resource limits.');
@@ -753,6 +757,34 @@ function createServer() {
     { name: 'gemini-local-bash-poc', version: '0.3.0' },
     { instructions: instructions.join(' ') },
   );
+  const registerTool = server.registerTool.bind(server);
+  server.registerTool = (name, settings, callback) => registerTool(name, settings, async (...args) => {
+    const metadata = {
+      ...auditMetadata(name, args[0]),
+      capability: toolCapabilities[name],
+      client_fingerprint: auditContext.clientFingerprint,
+      request_id: auditContext.requestId,
+    };
+    // Fail closed: do not execute a tool unless the start event is persisted.
+    await audit.record({ ...metadata, event: 'tool.started' });
+    const started = performance.now();
+    let result;
+    try {
+      result = await callback(...args);
+    } catch (error) {
+      await audit.record({
+        ...metadata, event: 'tool.finished', outcome: 'failure',
+        duration_ms: Math.floor(performance.now() - started),
+      });
+      throw error;
+    }
+    await audit.record({
+      ...metadata, event: 'tool.finished',
+      ...auditResultMetadata(result),
+      duration_ms: Math.floor(performance.now() - started),
+    });
+    return result;
+  });
 
   if (enabledBackends.includes('docker')) {
     server.registerTool(
@@ -1179,6 +1211,29 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'gemini-local-ba
 
 app.use(endpointPath, oauthSecurity.requireAuthentication);
 app.post(endpointPath, async (req, res) => {
+  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const capabilities = bearer ? oauthSecurity.provider.capabilitiesForToken(bearer) : [];
+  const denied = deniedToolCall(req.body, capabilities);
+  if (denied) {
+    console.warn(`MCP denied tool=${denied.tool} missingCapability=${denied.capability}`);
+    try {
+      await audit.record({
+        ...auditMetadata(denied.tool),
+        event: 'tool.denied', outcome: 'denied',
+        capability: denied.capability, http_status: 403,
+        client_fingerprint: fingerprintClient(req.auth?.clientId),
+        request_id: newAuditRequestId(),
+      });
+    } catch (error) {
+      console.error('Audit write failure; denying request:', error.message);
+      return res.status(503).json({ error: 'Execution auditing is unavailable; request refused.' });
+    }
+    return res.status(403).json({
+      jsonrpc: '2.0',
+      error: { code: -32003, message: `MCP client is not authorized for capability ${denied.capability}. Reauthorize and explicitly approve this capability.` },
+      id: Array.isArray(req.body) ? null : req.body?.id ?? null,
+    });
+  }
   if (!consumeToolCallRateLimit(req.body)) {
     return res.status(429).json({
       jsonrpc: '2.0',
@@ -1208,7 +1263,10 @@ app.post(endpointPath, async (req, res) => {
     }
   }
 
-  const server = createServer();
+  const server = createServer({
+    clientFingerprint: fingerprintClient(req.auth?.clientId),
+    requestId: newAuditRequestId(),
+  });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   try {
     await server.connect(transport);
@@ -1250,6 +1308,7 @@ async function detectHostShell(shell) {
 }
 
 async function start() {
+  await audit.open();
   if (requestedBackends.includes('docker') || requestedBackends.includes('project')) {
     sandboxDockerHost = defaultSandboxDockerHost();
     await ensureSandboxBackend();
@@ -1312,6 +1371,7 @@ async function start() {
     console.log(`MCP PoC listening on http://127.0.0.1:${port}${endpointPath}`);
     console.log(`OAuth 2.1/PKCE protection enabled for ${oauthSecurity.resourceUrl.href}. Restart after changing MCP_PUBLIC_URL or MCP_AUTH_PASSWORD.`);
     console.log(`Detected and enabled backends: ${enabledBackends.join(', ')}.`);
+    console.log(`Redacted structured execution audit enabled: ${auditPath}.`);
     if (enabledBackends.includes('docker')) {
       console.log(`Sandbox Docker daemon: ${sandboxDockerHost} (rootless; runtime=${sandboxRuntime})`);
       console.log(`Sandbox resource policy: ${sandboxTimeoutSeconds}s per command; per-container scopes are 256 MiB memory, no swap, 0.25 CPU, 64 host tasks; the aggregate sandbox slice allows 1.5 GiB, no swap, 100% CPU, 512 tasks; the Docker service allows 768 MiB, 100% CPU, 256 tasks; max ${maxSandboxConcurrency} concurrent calls.`);

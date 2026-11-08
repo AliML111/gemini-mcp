@@ -9,7 +9,7 @@ This proof of concept connects Gemini Apps to local tools through MCP. Gemini re
 - Browser control is available as a separate Playwright MCP connector. Gemini can use both connectors in the same panel; the browser server owns its browser lifecycle and session state.
 - The optional `project` backend runs configured web-project checks and previews inside managed gVisor sessions. Project paths and commands are explicitly configured by the MCP server administrator; the backend is not enabled by default.
 
-All requests to the `/mcp` endpoint require OAuth 2.1 authorization code flow with PKCE. The server requires the exact public HTTPS MCP URL and an administrator-held access password at startup; Gemini's OAuth authorization page asks for that password before issuing tokens. Dynamic client registration and protected-resource metadata are enabled. OAuth client registrations and tokens are held in memory, so restarting the server requires reconnecting the Gemini custom app.
+All requests to the `/mcp` endpoint require OAuth 2.1 authorization code flow with PKCE. **The authorization page now requests individual capabilities for sandbox execution, network access, filesystem read/write, project execution/networking, and unsandboxed host commands.** Only sandbox execution is preselected; every other capability must be explicitly selected at authorization. The server enforces those grants on each `tools/call` request (including batches). Clients connected before this change must reconnect and grant the needed capabilities.  The server requires the exact public HTTPS MCP URL and an administrator-held access password at startup; Gemini's OAuth authorization page asks for that password before issuing tokens. Dynamic client registration and protected-resource metadata are enabled. OAuth client registrations and tokens are held in memory, so restarting the server requires reconnecting the Gemini custom app.
 
 ## Select backends at startup
 
@@ -176,13 +176,7 @@ npx -y @playwright/mcp@latest --port 8931 --host 127.0.0.1
 npx -y @playwright/mcp@latest --port 8931 --host 127.0.0.1 --extension
 ```
 
-If Gemini requires a public HTTPS URL for a remote custom app, start a temporary Quick Tunnel for the browser service in another terminal:
-
-```bash
-cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8931 --http-host-header 127.0.0.1:8931
-```
-
-Add the printed `https://…trycloudflare.com/mcp` URL as a second custom app in Gemini. Stop both the browser MCP server and tunnel when done. A Quick Tunnel URL is a bearer secret, not authentication; anyone who learns it can control that browser session. The browser extension can expose pages where the user is signed in, so do not use an unauthenticated public tunnel for persistent access. Playwright also documents that its MCP server is not itself a security boundary.
+**Do not expose the Playwright MCP server through an unauthenticated Cloudflare Quick Tunnel.** The browser connector can read and operate authenticated tabs, and a random tunnel URL does not provide access control. Keep the browser MCP endpoint bound to loopback for a trusted local client. When a remote Gemini custom app requires HTTPS, use a separate, authentication-capable MCP gateway with per-client authorization and narrow browser capabilities; do not assume that Cloudflare Access or other identity middleware will work with Gemini until its end-to-end OAuth and transport flow has been tested. If there is no verified compatible gateway, leave remote browser control disabled and use a separate isolated browser profile for local testing. The browser MCP process must not share sensitive Chrome profiles by default.
 
 Add `gemini-skill/SKILL.md` as a reusable skill in Gemini to teach it how to choose between the file tools, the Docker or host shell backend, and the Playwright browser connector.
 
@@ -193,6 +187,34 @@ npm run smoke
 ```
 
 For tests that do **not** require Docker or Gemini, run `npm test` (uses Node's built-in test runner and a fake Docker backend).
+
+### MCP authorization policy
+
+The administrator password authenticates a person at OAuth consent time; it is **not** blanket authorization to every tool. The consent form exposes seven capabilities:
+
+- `sandbox:execute`: disposable or managed sandbox commands (selected by default)
+- `sandbox:network`: opting those sandboxes into the rootless bridge network
+- `filesystem:read` / `filesystem:write`: direct host filesystem access to configured roots
+- `project:execute` / `project:network`: configured project workflow, with separate outbound network opt-in
+- `host:execute`: arbitrary Bash/PowerShell with the MCP server user's host permissions
+
+Each authenticated tool request is checked server-side against the capabilities granted to that OAuth client. Refresh tokens preserve those grants and cannot add new ones. A client must reconnect and reauthorize to gain a capability. Dynamic client registration is limited to 10 registrations per 15 minutes and registrations expire after seven days; these limits reduce memory exhaustion but do not replace upstream abuse protection. The OAuth provider still stores tokens and clients in memory and loses them at restart.
+
+**Compatibility:** existing Gemini clients must reconnect after installing this version. If a needed tool returns HTTP 403, reauthorize and select its capability; never disable authorization as a workaround. Be especially careful with host and filesystem write grants. Host-shell tools remain unsandboxed even when accessed through OAuth. These controls protect the MCP entrypoint, not commands manually run outside the server.
+
+### Structured execution audit
+
+The MCP server writes an append-only JSON Lines audit by default to `$XDG_STATE_HOME/gemini-mcp/execution-audit.jsonl` (or `$HOME/.local/state/gemini-mcp/execution-audit.jsonl` when unset). Set `MCP_AUDIT_LOG` to an absolute path to use another destination.
+
+Audit events include a correlation UUID, a truncated one-way client-ID fingerprint, tool name, capability, start/finish/denial, duration, network opt-in flag, batch size, and available exit/timeout status. Schema: `gemini-mcp.audit.v1`. **Raw commands, file paths, file contents, tool arguments, bearer tokens and tool output are not recorded.**
+
+The server refuses to start without a private (0600) audit file, and refuses a new tool invocation when the start event cannot be persisted. A write failure after command execution cannot undo the action. These JSONL records are operational audits, not a tamper-evident ledger. Keep logs private; establish retention and collection controls. Restart the service after log rotation because the file handle remains open. Logs are not automatically purged.
+
+### SQLite single-instance ownership
+
+The Docker workspace registry now acquires an exclusive kernel-backed `flock(1)` lock at `<SANDBOX_STATE_DB>.owner.lock` **before** opening the SQLite database or reconciling containers. A second process with the same state path fails startup. The lock is held by a helper process connected to the owner through stdin and automatically releases when its process exits, including after a crash.
+
+**Never delete the lock file to free the registry.** The inode is intentionally persistent. The owner-lock helper requires Linux and util-linux `flock`. This is a single-host file lock, not a distributed lease: do not share the database on an unreliable filesystem or run multiple servers against the same Docker daemon with different registry paths.
 
 ### Local SQLite workspace manager
 

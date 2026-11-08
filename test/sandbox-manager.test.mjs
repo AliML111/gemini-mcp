@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { SandboxManager } from '../src/sandbox-manager.mjs';
 
 function fakeContainer(name, labels, id = randomUUID()) {
@@ -101,7 +102,7 @@ test('creates, lists, executes and deletes a SQLite-backed sandbox', async (t) =
 test('reconcile keeps active workspaces across server restart', async (t) => {
   const { manager, createManager, dockerFake } = await fixture(t);
   const id = await manager.create();
-  manager.close();
+  await manager.close();
   const recovered = createManager();
   await recovered.open();
   t.after(() => recovered.close());
@@ -115,7 +116,7 @@ test('reconcile deletes interrupted busy workspace rather than trusting it', asy
   const { manager, createManager, dockerFake } = await fixture(t);
   const id = await manager.create();
   manager.db.prepare("UPDATE workspaces SET state='busy' WHERE id=?").run(id);
-  manager.close();
+  await manager.close();
   const restarted = createManager();
   await restarted.open();
   t.after(() => restarted.close());
@@ -128,7 +129,7 @@ test('reconcile completes a crash-interrupted creation when Docker container exi
   const { manager, createManager } = await fixture(t);
   const id = await manager.create();
   manager.db.prepare("UPDATE workspaces SET state='creating', container_id=NULL WHERE id=?").run(id);
-  manager.close();
+  await manager.close();
   const restarted = createManager();
   await restarted.open();
   t.after(() => restarted.close());
@@ -216,7 +217,7 @@ test('missing container and expired workspace are pruned during reconcile', asyn
   const { manager, createManager, dockerFake } = await fixture(t);
   const id = await manager.create();
   dockerFake.containers.clear();
-  manager.close();
+  await manager.close();
   const restarted = createManager();
   await restarted.open();
   t.after(() => restarted.close());
@@ -245,4 +246,64 @@ test('orphan cleanup fails closed for unexpected isolation settings', async (t) 
   dockerFake.containers.set(name, orphan);
   await assert.rejects(manager.reconcile(), /unexpected Docker isolation settings/);
   assert.equal(dockerFake.containers.size, 1);
+});
+
+test('second manager cannot take the same SQLite owner lock until first closes', async (t) => {
+  const { manager, createManager } = await fixture(t);
+  const contender = createManager();
+  await assert.rejects(contender.open(), /already owned by another MCP process/);
+  assert.equal(contender.db, null, 'loser must never open the SQLite database');
+  await manager.close();
+  await contender.open();
+  t.after(() => contender.close());
+  assert.deepEqual(contender.list(), []);
+});
+
+test('failed database initialization releases owner lock for a retry', async (t) => {
+  const { manager, createManager } = await fixture(t);
+  await manager.close();
+  const retry = createManager();
+  await retry.open();
+  t.after(() => retry.close());
+  assert.deepEqual(retry.list(), []);
+});
+
+test('kernel lock is released after abrupt owner-process death', async (t) => {
+  const { manager, createManager, dbPath } = await fixture(t);
+  await manager.close();
+  const source = [
+    "import { RegistryOwnerLock } from " + JSON.stringify(new URL('../src/registry-owner-lock.mjs', import.meta.url).href) + ";",
+    "const lock = new RegistryOwnerLock(process.argv[1]);",
+    "await lock.acquire();",
+    "process.stdout.write('READY\\n');",
+    "setInterval(() => {}, 60000);",
+  ].join('\n');
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source, `${dbPath}.owner.lock`], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  await new Promise((resolve, reject) => {
+    let output = '';
+    const timeout = setTimeout(() => reject(new Error('lock subprocess did not start')), 5000);
+    child.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+      if (output.includes('READY\n')) { clearTimeout(timeout); resolve(); }
+    });
+    child.once('error', (error) => { clearTimeout(timeout); reject(error); });
+    child.once('exit', (code) => { clearTimeout(timeout); reject(new Error(`child exited early: ${code}`)); });
+  });
+  const contender = createManager();
+  await assert.rejects(contender.open(), /already owned by another MCP process/);
+  child.kill('SIGKILL');
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      await contender.open();
+      t.after(() => contender.close());
+      assert.deepEqual(contender.list(), []);
+      return;
+    } catch (error) {
+      if (!/already owned/.test(error.message) || attempt === 29) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 });
