@@ -1,6 +1,6 @@
 ---
 name: gemini-local-tools
-description: Use connected MCP tools for local project files, container or host shell commands, and browser work through Playwright. Gemini remains the agent that plans and chooses tools.
+description: Use connected MCP tools for local files, container or host commands, browser tabs, and Windows apps. Gemini remains the agent that plans and chooses tools.
 ---
 
 # Gemini local tools
@@ -13,7 +13,11 @@ Use the connected MCP tools for the local operations the user requested. Never c
 - For isolated shell work, use `run_sandbox_bash` for one command or `run_sandbox_session` for up to four sequential commands in a shared temporary workspace. The default lifecycle is ephemeral and deletes the workspace after the batch. Use `conversation` or `task` only if later calls need the files, then reuse the returned `session_id`; the server expires the container automatically.
 - Container networking is disabled by default. Set `internet_access=true` only when needed. This selects the rootless Docker bridge, which may reach services visible from that network. Keep a session's original network setting when reusing it.
 - Use `run_host_commands` only when the user requests direct local host execution or names Bash/PowerShell as the desired shell. It runs with the MCP server user's full permissions and is not isolated. Group related commands in the `commands` array; every command runs in a fresh process with the same working directory.
-- For browser interaction, use the separate Playwright MCP connector. Navigate, then inspect `browser_snapshot` before selecting elements. Use references from the latest snapshot for clicks and typing. Do not assume browser state, logins, or a page action succeeded without the tool result.
+- For browser tasks, prefer the `mcp_browser_*` tools and do not use Windows desktop controls on Chrome or Edge. Start with `browser_tabs` action `list`, then use only the existing tab or tabs needed for the requested task. Use `select` to switch to a needed existing tab. Open a new tab only when the task needs a separate page; close only a tab you opened for this task, and never close the user's pre-existing tabs unless asked. Navigate only the selected tab as needed, inspect the latest browser snapshot before acting, and use its references for clicks and typing.
+- Use `mcp_windows-desktop_*` tools only when the user asks you to work in a Windows app or the requested task requires a desktop-only action. Do not switch to desktop control for routine browser work. Before using `App`, inspect the latest UI snapshot and switch to an already-open app window when available; launch the app only when it is not already open and the task requires opening it. Do not close or relaunch apps as a routine step. Use named UI Automation controls when available and verify consequential actions.
+- For a Windows action followed by inspection, prefer `desktop_act_and_observe` when available. Use `desktop_run_steps` for up to four steps in one foreground window. Supply its exact title and use accessibility targets. If the helper stops, inspect the returned snapshot and whether it attempted an action before retrying.
+- Use `mcp_status` to check which backends and module connections the gateway reports before troubleshooting missing tools.
+- Use browser and desktop tools in the same task only when the requested workflow actually needs both. Keep unrelated apps and tabs untouched.
 
 ## Work in small batches
 
@@ -42,6 +46,6 @@ Use the connected MCP tools for the local operations the user requested. Never c
 
 ## Report results
 
-- Summarize what changed and cite the relevant paths. For commands, report relevant exit codes and errors. For browser tasks, summarize the observed page and the action result.
+- Summarize what changed and cite the relevant paths. For commands, report relevant exit codes and errors. For browser or desktop tasks, summarize the observed state and the action result.
 - Mention when an ephemeral container was deleted or when a retained session will expire automatically.
 - If a requested connector or tool is missing, state which one is unavailable and give the exact connection/setup step; do not silently substitute a more privileged backend.
