@@ -35,7 +35,20 @@ test('execution audit appends sanitized structured records without raw arguments
   assert.equal(events[0].batch_size, 2);
   assert.equal(events[0].network_requested, true);
   assert.equal(events[1].exit_code, 4);
-  assert.equal((await stat(path)).mode & 0o077, 0);
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o077, 0);
+});
+
+test('deferred finish records are drained on close without waiting in the caller', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gemini-audit-deferred-test-'));
+  t.after(() => rm(dir, { force: true, recursive: true }));
+  const path = join(dir, 'audit.jsonl');
+  const logger = new ExecutionAudit(path);
+  await logger.open();
+  await logger.record({ event: 'tool.started', tool: 'read_file' });
+  void logger.recordDeferred({ event: 'tool.finished', tool: 'read_file', outcome: 'success', duration_ms: 5 });
+  await logger.close();
+  const events = (await readFile(path, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(events.map((event) => event.event), ['tool.started', 'tool.finished']);
 });
 
 test('audit refuses symlink and cannot proceed without an open audit file', async (t) => {
@@ -47,7 +60,15 @@ test('audit refuses symlink and cannot proceed without an open audit file', asyn
   await assert.rejects(file.record({ event: 'tool.started' }), /not open/);
   await file.open();
   await file.close();
-  await symlink(original, target);
+  try {
+    await symlink(original, target);
+  } catch (error) {
+    if (process.platform === 'win32' && ['EACCES', 'EPERM'].includes(error.code)) {
+      t.skip('Creating symbolic links requires Windows Developer Mode or elevation.');
+      return;
+    }
+    throw error;
+  }
   await assert.rejects(new ExecutionAudit(target).open(), /ELOOP|symbolic link|symlink/);
 });
 

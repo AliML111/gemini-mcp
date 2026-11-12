@@ -3,9 +3,29 @@
  * filesystem paths, authorization headers, tool output or token values.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { mkdir, open } from 'node:fs/promises';
+import { mkdir, open, rename } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
+
+export async function restrictWindowsAuditFile(path) {
+  const { stdout } = await execFileAsync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], {
+    encoding: 'utf8', maxBuffer: 4_096, timeout: 5_000, windowsHide: true,
+  });
+  const userSid = /\bS-1-\d+(?:-\d+)+\b/.exec(stdout)?.[0];
+  if (!userSid) throw new Error('Could not determine the current Windows account SID for the audit log.');
+  await execFileAsync('icacls.exe', [
+    path,
+    '/inheritance:r',
+    '/grant:r',
+    `*${userSid}:F`,
+    '*S-1-5-18:F',
+    '*S-1-5-32-544:F',
+  ], { encoding: 'utf8', maxBuffer: 4_096, timeout: 5_000, windowsHide: true });
+}
 
 const knownEvents = new Set(['tool.started', 'tool.finished', 'tool.denied']);
 const knownOutcomes = new Set(['success', 'failure', 'denied']);
@@ -14,7 +34,7 @@ const allowedFields = new Set([
   'exit_code', 'timed_out', 'network_requested', 'batch_size', 'client_fingerprint',
   'request_id',
 ]);
-const allowedTools = /^[a-z][a-z0-9_]{0,79}$/;
+const allowedTools = /^[a-z][A-Za-z0-9_-]{0,79}$/;
 const allowedCapability = /^[a-z][a-z0-9:_-]{0,79}$/;
 
 export function fingerprintClient(clientId) {
@@ -69,6 +89,9 @@ export class ExecutionAudit {
     this.path = path;
     this.file = null;
     this.queue = Promise.resolve();
+    this.pending = 0;
+    this.bytes = 0;
+    this.closing = false;
   }
 
   async open() {
@@ -76,11 +99,13 @@ export class ExecutionAudit {
     const flags = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0);
     const file = await open(this.path, flags, 0o600);
     try {
+      if (process.platform === 'win32') await restrictWindowsAuditFile(this.path);
       const stat = await file.stat();
-      if (!stat.isFile() || (stat.mode & 0o077) !== 0) {
-        throw new Error('Audit log must be a regular file with no group or world permissions.');
+      if (!stat.isFile() || (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) {
+        throw new Error('Audit log must be a regular file with private permissions.');
       }
       this.file = file;
+      this.bytes = stat.size;
     } catch (error) {
       await file.close();
       throw error;
@@ -88,7 +113,8 @@ export class ExecutionAudit {
   }
 
   record(fields) {
-    if (!this.file) return Promise.reject(new Error('Audit log is not open.'));
+    if (this.closing || !this.file) return Promise.reject(new Error('Audit log is not open.'));
+    if (this.pending >= 256) return Promise.reject(new Error('Audit queue is full.'));
     // Explicit field and type allowlist: accidental arguments/output cannot be logged.
     const safe = { timestamp: new Date().toISOString(), schema: 'gemini-mcp.audit.v1' };
     for (const [key, value] of Object.entries(fields ?? {})) {
@@ -105,12 +131,34 @@ export class ExecutionAudit {
     }
     if (!knownEvents.has(safe.event)) return Promise.reject(new Error('Invalid audit event.'));
     const line = JSON.stringify(safe) + '\n';
-    const write = () => this.file.writeFile(line, { encoding: 'utf8' });
-    this.queue = this.queue.then(write, write);
+    const size = Buffer.byteLength(line);
+    const write = async () => {
+      if (!this.file) await this.open();
+      if (this.bytes + size > 16 * 1024 * 1024) {
+        await this.file.close();
+        this.file = null;
+        try {
+          await rename(this.path, this.path + '.1');
+        } finally {
+          await this.open();
+        }
+      }
+      await this.file.writeFile(line, { encoding: 'utf8' });
+      this.bytes += size;
+    };
+    this.pending += 1;
+    this.queue = this.queue.then(write, write).finally(() => { this.pending -= 1; });
     return this.queue;
   }
 
+  recordDeferred(fields) {
+    return this.record(fields).catch((error) => {
+      console.error('Execution audit background write failed:', error.message);
+    });
+  }
+
   async close() {
+    this.closing = true;
     await this.queue.catch(() => {});
     if (this.file) await this.file.close();
     this.file = null;
