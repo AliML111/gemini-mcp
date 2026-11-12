@@ -1,5 +1,5 @@
 import { lstat, readFile as readFileAsync, readdir, realpath, rename, stat, unlink, writeFile as writeFileAsync } from 'node:fs/promises';
-import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -8,8 +8,10 @@ const maxReadOutputBytes = 64 * 1024;
 const maxWriteBytes = 128 * 1024;
 const maxSearchFileBytes = 1024 * 1024;
 const maxSearchFiles = 2_000;
+const maxConcurrentSearches = 4;
 const maxSearchMatches = 50;
-const skippedDirectories = new Set(['.git', 'node_modules', 'vendor', 'dist', 'build']);
+const protectedDirectories = new Set(['.git', '.gemini-mcp', 'node_modules']);
+const skippedDirectories = new Set([...protectedDirectories, 'vendor', 'dist', 'build']);
 const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 
 function isWithin(target, root) {
@@ -18,22 +20,32 @@ function isWithin(target, root) {
 }
 
 export async function initializeFilesystemBackend(configuredRoots = process.env.MCP_FILESYSTEM_ROOTS) {
-  const candidates = configuredRoots
-    ? configuredRoots.split(delimiter).map((value) => value.trim()).filter(Boolean)
-    : [projectRoot];
+  if (typeof configuredRoots !== 'string' || !configuredRoots.trim()) {
+    throw new Error('MCP_FILESYSTEM_ROOTS must explicitly name one or more data directories outside the MCP application directory.');
+  }
+  const candidates = configuredRoots.split(delimiter).map((value) => value.trim()).filter(Boolean);
   if (candidates.length === 0) throw new Error('MCP_FILESYSTEM_ROOTS must contain at least one directory.');
 
+  const applicationRoot = await realpath(projectRoot);
   const roots = [];
   for (const candidate of candidates) {
     if (!isAbsolute(candidate)) throw new Error(`Filesystem root must be absolute: ${candidate}`);
     const canonical = await realpath(candidate);
     if (!(await stat(canonical)).isDirectory()) throw new Error(`Filesystem root must be a directory: ${candidate}`);
+    if (isWithin(canonical, applicationRoot) || isWithin(applicationRoot, canonical)) {
+      throw new Error(`Filesystem root must not overlap the MCP application directory: ${candidate}`);
+    }
+    if (protectedDirectories.has(basename(canonical).toLocaleLowerCase())) {
+      throw new Error(`Filesystem root cannot be a protected directory: ${candidate}`);
+    }
     if (!roots.includes(canonical)) roots.push(canonical);
   }
   return new FilesystemBackend(roots);
 }
 
 class FilesystemBackend {
+  #activeSearches = 0;
+
   constructor(roots) {
     this.roots = roots;
   }
@@ -48,15 +60,21 @@ class FilesystemBackend {
     for (const candidate of candidates) {
       try {
         const canonical = await realpath(candidate);
-        if (this.roots.some((root) => isWithin(canonical, root))) return canonical;
+        const root = this.roots.find((item) => isWithin(canonical, item));
+        if (root) {
+          this.assertPathNotProtected(canonical, root);
+          return canonical;
+        }
         throw new Error('path is outside the configured filesystem roots.');
       } catch (error) {
-        if (error.message.includes('outside the configured')) throw error;
+        if (error.message.includes('outside the configured') || error.message.includes('protected directory')) throw error;
         lastError = error;
         if (!allowMissing || error.code !== 'ENOENT') continue;
         const parent = await realpath(join(candidate, '..')).catch(() => null);
         const root = this.roots.find((item) => parent && isWithin(parent, item));
         if (!root) continue;
+        this.assertPathNotProtected(candidate, root);
+        this.assertPathNotProtected(parent, root);
         try {
           await lstat(candidate);
           throw new Error('Refusing to write through a symbolic link.');
@@ -71,10 +89,18 @@ class FilesystemBackend {
     throw lastError ?? new Error(`Path is outside the configured filesystem roots: ${inputPath}`);
   }
 
+  assertPathNotProtected(path, root) {
+    const pathFromRoot = relative(root, path);
+    if (pathFromRoot.split(sep).some((part) => protectedDirectories.has(part.toLocaleLowerCase()))) {
+      throw new Error('path is inside a protected directory (.git, .gemini-mcp, or node_modules).');
+    }
+  }
+
   async listFiles(path = '.', limit = 200) {
     const directory = await this.resolvePath(path);
     if (!(await stat(directory)).isDirectory()) throw new Error('path must point to a directory.');
-    const entries = await readdir(directory, { withFileTypes: true });
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .filter((entry) => !protectedDirectories.has(entry.name.toLocaleLowerCase()));
     entries.sort((left, right) => left.name.localeCompare(right.name));
     const shown = entries.slice(0, limit).map((entry) => ({
       name: entry.name,
@@ -106,6 +132,18 @@ class FilesystemBackend {
   }
 
   async searchFiles(query, path = '.', caseSensitive = false) {
+    if (this.#activeSearches >= maxConcurrentSearches) {
+      throw new Error('File search is at capacity. Retry after an active search finishes.');
+    }
+    this.#activeSearches += 1;
+    try {
+      return await this.#scanFiles(query, path, caseSensitive);
+    } finally {
+      this.#activeSearches -= 1;
+    }
+  }
+
+  async #scanFiles(query, path, caseSensitive) {
     const searchRoot = await this.resolvePath(path);
     const rootInfo = await stat(searchRoot);
     if (!rootInfo.isDirectory()) throw new Error('search path must point to a directory.');
@@ -130,7 +168,7 @@ class FilesystemBackend {
         if (entry.isSymbolicLink()) continue;
         const child = join(directory, entry.name);
         if (entry.isDirectory()) {
-          if (!skippedDirectories.has(entry.name)) await visit(child);
+          if (!skippedDirectories.has(entry.name.toLowerCase())) await visit(child);
           continue;
         }
         if (!entry.isFile()) continue;

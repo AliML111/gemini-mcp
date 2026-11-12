@@ -1,3 +1,7 @@
+import { createMcpHttpApp } from './mcp-http-app.mjs';
+import { DesktopWorkflow, desktopPrefix, desktopStepSchema, desktopWindowSchema } from './desktop-workflow.mjs';
+import { childEnvironment } from './child-environment.mjs';
+import { createWslBackend } from './wsl-backend.mjs';
 import { execFile, spawn } from 'node:child_process';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -9,15 +13,18 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import { openOAuthState } from './oauth-state.mjs';
 import { createMcpOAuthSecurity } from './mcp-oauth.mjs';
-import { deniedToolCall, toolCapabilities } from './tool-capabilities.mjs';
-import { ExecutionAudit, auditMetadata, auditResultMetadata, fingerprintClient, newAuditRequestId } from './execution-audit.mjs';
+import { toolCapabilities } from './tool-capabilities.mjs';
+import { ExecutionAudit, auditMetadata, auditResultMetadata } from './execution-audit.mjs';
+import { McpModuleManager, registerModuleTools, registerSkillResources } from './mcp-module-manager.mjs';
+import { createAdminDashboard } from './admin-dashboard.mjs';
+import { ToolCallRateLimiter } from './tool-rate-limiter.mjs';
 
 const execFileAsync = promisify(execFile);
 const port = Number.parseInt(process.env.MCP_PORT ?? '8787', 10);
+const adminPort = Number.parseInt(process.env.MCP_ADMIN_PORT ?? '8788', 10);
 const endpointPath = process.env.MCP_PATH ?? '/mcp';
 const sandboxImage = 'gemini-mcp-sandbox:0.1.0';
 const managedLabel = 'gemini-mcp-poc.managed=true';
@@ -27,7 +34,13 @@ const sandboxSystemdSlice = 'app-gemini-mcp-sandbox.slice';
 const sandboxRunscWrapperPath = fileURLToPath(new URL('../scripts/runsc-scope-wrapper.sh', import.meta.url));
 const projectRunscWrapperPath = fileURLToPath(new URL('../scripts/runsc-project-scope-wrapper.sh', import.meta.url));
 const sandboxTimeoutSeconds = 5;
-const hostCommandTimeoutMs = sandboxTimeoutSeconds * 1_000;
+const defaultShellTimeoutSeconds = 10;
+const maxShellCommandBytes = 8 * 1024;
+const shellTimeoutSchema = z.number().int().min(1).max(60).default(defaultShellTimeoutSeconds);
+const shellCommandSchema = z.string().min(1).max(maxShellCommandBytes).refine(
+  (command) => command.trim().length > 0 && Buffer.byteLength(command, 'utf8') <= maxShellCommandBytes,
+  'Command must contain 1 to 8192 UTF-8 bytes of script.',
+);
 const sandboxMaxOutputBytes = 64 * 1024;
 const sandboxMaxSessionCommands = 4;
 const sandboxContainerLimits = {
@@ -65,11 +78,13 @@ const workspaceLifecyclePolicies = {
   task: { idleTtlMs: taskWorkspaceIdleTtlMs, maxLifetimeMs: taskWorkspaceMaxLifetimeMs },
 };
 const maxToolCallsPerMinute = 30;
+const toolCallRateLimiter = new ToolCallRateLimiter({ limit: maxToolCallsPerMinute });
+const rpcRateLimiter = new ToolCallRateLimiter({ limit: 120, countAll: true });
 const requestedBackends = process.env.MCP_BACKENDS?.split(',').map((item) => item.trim().toLowerCase()).filter(Boolean)
   ?? ['docker'];
-const supportedBackends = new Set(['docker', 'project', 'bash', 'powershell', 'filesystem']);
+const supportedBackends = new Set(['docker', 'project', 'bash', 'powershell', 'filesystem', 'wsl', 'wsl-docker']);
 if (requestedBackends.length === 0 || requestedBackends.some((backend) => !supportedBackends.has(backend))) {
-  throw new Error('MCP_BACKENDS must be a comma-separated list containing docker, project, bash, powershell, and/or filesystem.');
+  throw new Error('MCP_BACKENDS must be a comma-separated list containing docker, project, bash, powershell, filesystem, wsl, and/or wsl-docker.');
 }
 if (requestedBackends.includes('project') && !requestedBackends.includes('docker')) {
   throw new Error('MCP_BACKENDS=project requires MCP_BACKENDS=docker,project.');
@@ -84,25 +99,32 @@ let workspaceManager = null;
 let workspaceCleanupTimer = null;
 let filesystemBackend = null;
 let projectWorkflow = null;
+let moduleManager = null;
+let oauthSecurity = null;
+let app = null;
+let mcpListener = null;
+let oauthStateDb;
+let adminListener = null;
 const auditPath = process.env.MCP_AUDIT_LOG ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'gemini-mcp', 'execution-audit.jsonl');
 const audit = new ExecutionAudit(auditPath);
 const hostShellExecutables = new Map();
+const desktopWorkflow = new DesktopWorkflow();
+let wslBackend;
+const wslDockerImage = process.env.MCP_WSL_DOCKER_IMAGE;
 let enabledBackends = [];
 let activeToolExecutions = 0;
-let toolCallWindowStartedAt = Date.now();
-let toolCallsInWindow = 0;
+const maxHostConcurrency = 4;
+let activeHostCommands = 0;
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error('MCP_PORT must be a valid TCP port.');
 }
+if (!Number.isInteger(adminPort) || adminPort < 1 || adminPort > 65535 || adminPort === port) {
+  throw new Error('MCP_ADMIN_PORT must be a valid port different from MCP_PORT.');
+}
 if (!endpointPath.startsWith('/') || endpointPath.includes('?') || endpointPath.includes('#')) {
   throw new Error('MCP_PATH must be an absolute URL path.');
 }
-const oauthSecurity = createMcpOAuthSecurity({
-  publicUrl: process.env.MCP_PUBLIC_URL,
-  password: process.env.MCP_AUTH_PASSWORD,
-  endpointPath,
-});
 const projectNetworkAccessAllowed = process.env.MCP_PROJECT_ALLOW_NETWORK === 'true';
 for (const [lifecycle, policy] of Object.entries(workspaceLifecyclePolicies)) {
   if (!Number.isSafeInteger(policy.idleTtlMs) || policy.idleTtlMs < 1_000
@@ -501,7 +523,7 @@ async function executeSessionCommand(containerName, command) {
   }
 }
 
-async function runSandboxSession(commands, { sessionId = null, internetAccess, lifecycle } = {}) {
+async function runSandboxSession(commands, { sessionId = null, internetAccess, lifecycle, ownerId } = {}) {
   if (commands.length > sandboxMaxSessionCommands) {
     throw new Error(`A sandbox session call accepts at most ${sandboxMaxSessionCommands} commands.`);
   }
@@ -523,6 +545,9 @@ async function runSandboxSession(commands, { sessionId = null, internetAccess, l
   let cleanupAttempted = false;
   try {
     if (sessionId) {
+      if (!ownerId || workspaceManager.row(sessionId)?.owner_id !== ownerId) {
+        throw new Error('Sandbox session is not available to this client.');
+      }
       const session = workspaceManager.inspect(sessionId);
       if (lifecycle !== undefined && lifecycle !== session.lifecycle) {
         throw new Error(`This session uses the ${session.lifecycle} lifecycle; reuse it without changing lifecycle.`);
@@ -538,6 +563,7 @@ async function runSandboxSession(commands, { sessionId = null, internetAccess, l
       }
       effectiveSessionId = await workspaceManager.create({
         internetAccess: networkAccess,
+        ownerId,
         lifecycle: effectiveLifecycle === 'ephemeral' ? 'conversation' : effectiveLifecycle,
       });
       created = true;
@@ -607,17 +633,19 @@ async function runSandboxSession(commands, { sessionId = null, internetAccess, l
   }
 }
 
-async function runHostShellCommand(shell, command, cwd) {
+async function runHostShellCommand(shell, command, cwd, timeoutSeconds) {
   const executable = hostShellExecutables.get(shell);
   if (!executable) throw new Error(`${shell} was not enabled or detected when this server started.`);
   const args = shell === 'bash'
-    ? ['--noprofile', '--norc', '-c', command]
-    : ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command];
+    ? ['--noprofile', '--norc', '-s']
+    : ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+      '[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); & ([ScriptBlock]::Create([Console]::In.ReadToEnd()))'];
   const child = spawn(executable, args, {
     cwd,
+    env: childEnvironment(),
     windowsHide: true,
     detached: process.platform !== 'win32',
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
   return new Promise((resolve, reject) => {
     const stdout = [];
@@ -656,8 +684,12 @@ async function runHostShellCommand(shell, command, cwd) {
     const timeout = setTimeout(() => {
       timedOut = true;
       terminateTree();
-    }, hostCommandTimeoutMs);
+    }, timeoutSeconds * 1_000);
     timeout.unref();
+    child.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE' && error.code !== 'ERR_STREAM_DESTROYED') terminateTree();
+    });
+    child.stdin.end(command, 'utf8');
     child.stdout.on('data', (chunk) => {
       append(stdout, chunk);
       if (outputLimit) terminateTree();
@@ -677,12 +709,13 @@ async function runHostShellCommand(shell, command, cwd) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
       resolve({
         exit_code: timedOut ? 124 : outputLimit ? 1 : Number.isInteger(code) ? code : 1,
         timed_out: timedOut,
         stdout: Buffer.concat(stdout).toString('utf8'),
         stderr: [Buffer.concat(stderr).toString('utf8'),
-          timedOut ? `Command exceeded the ${sandboxTimeoutSeconds}-second execution limit.` : '',
+          timedOut ? `Command exceeded the ${timeoutSeconds}-second execution limit.` : '',
           outputLimit ? `Output exceeded the ${sandboxMaxOutputBytes}-byte capture limit.` : '']
           .filter(Boolean).join('\n'),
         output_truncated: outputLimit,
@@ -691,29 +724,25 @@ async function runHostShellCommand(shell, command, cwd) {
   });
 }
 
-async function runHostCommands(shell, commands, workingDirectory) {
+async function runHostCommands(shell, commands, workingDirectory, parallel, timeoutSeconds) {
   if (!hostShellExecutables.has(shell)) throw new Error(`${shell} is not available in the enabled host backends.`);
   if (commands.length > sandboxMaxSessionCommands) {
     throw new Error(`A host shell call accepts at most ${sandboxMaxSessionCommands} commands.`);
   }
-  const commandBytes = commands.reduce((total, command) => total + Buffer.byteLength(command, 'utf8'), 0);
-  if (commands.some((command) => Buffer.byteLength(command, 'utf8') > 1_000) || commandBytes > 4_000) {
-    throw new Error('Each command must be at most 1,000 UTF-8 bytes and the combined commands at most 4,000 bytes.');
+  const slots = parallel ? commands.length : 1;
+  if (activeHostCommands + slots > maxHostConcurrency) {
+    throw new Error('Host command runner is at capacity. Retry after another run finishes.');
   }
-  if (activeToolExecutions >= maxSandboxConcurrency) {
-    throw new Error('Command runner is at capacity. Retry after another run finishes.');
-  }
-  activeToolExecutions += 1;
+  activeHostCommands += slots;
   try {
     const requestedDirectory = workingDirectory ?? process.cwd();
     if (!isAbsolute(requestedDirectory)) throw new Error('working_directory must be an absolute path.');
     const cwd = await realpath(requestedDirectory);
     if (!(await stat(cwd)).isDirectory()) throw new Error('working_directory must point to a directory.');
-    const results = [];
-    for (const [index, command] of commands.entries()) {
+    const runCommand = async (command, index) => {
       let result;
       try {
-        result = await runHostShellCommand(shell, command, cwd);
+        result = await runHostShellCommand(shell, command, cwd, timeoutSeconds);
       } catch (error) {
         result = {
           exit_code: 127,
@@ -723,34 +752,115 @@ async function runHostCommands(shell, commands, workingDirectory) {
           output_truncated: false,
         };
       }
-      results.push({ index: index + 1, command, ...result });
+      return { index: index + 1, command, ...result };
+    };
+    const results = [];
+    if (parallel) {
+      results.push(...await Promise.all(commands.map(runCommand)));
+    } else {
+      for (const [index, command] of commands.entries()) {
+        results.push(await runCommand(command, index));
+      }
     }
     const report = {
       backend: shell,
       working_directory: cwd,
       error: null,
-      output_truncated: false,
+      output_truncated: results.some((result) => result.output_truncated),
       results,
     };
     return { content: [{ type: 'text', text: serializeSessionReport(report) }], structuredContent: report };
   } finally {
-    activeToolExecutions -= 1;
+    activeHostCommands -= slots;
   }
 }
 
-function createServer(auditContext = {}) {
-  const instructions = [];
-  if (enabledBackends.includes('docker')) {
+const builtinCapabilityDefinitions = [
+  { id: 'sandbox:execute', label: 'Execute isolated sandbox commands', defaultSelected: true },
+  { id: 'sandbox:network', label: 'Allow sandbox internet/network access' },
+  { id: 'filesystem:read', label: 'Read configured host filesystem roots' },
+  { id: 'filesystem:write', label: 'Modify files inside configured host filesystem roots' },
+  { id: 'project:execute', label: 'Run configured project checks and manage reviews' },
+  { id: 'project:network', label: 'Allow project sessions with outbound network access' },
+  { id: 'gateway:status', label: 'View gateway backend and connection status' },
+  { id: 'host:execute', label: 'Execute arbitrary commands directly on the host' },
+  { id: 'wsl:execute', label: 'Execute shell commands in the configured WSL distribution' },
+  { id: 'wsl:docker', label: 'Run the approved Docker image from WSL' },
+];
+
+function capabilityAvailable(id) {
+  if (id === 'gateway:status') return true;
+  if (id === 'desktop:interact') {
+    const tools = moduleManager?.getToolCapabilities();
+    return Boolean(tools?.has(desktopPrefix + 'Snapshot') && ['Click', 'Invoke', 'Shortcut'].some((name) => tools.has(desktopPrefix + name)));
+  }
+  if (id.startsWith('sandbox:')) return enabledBackends.includes('docker');
+  if (id.startsWith('filesystem:')) return enabledBackends.includes('filesystem');
+  if (id === 'project:execute') return enabledBackends.includes('project');
+  if (id === 'project:network') return enabledBackends.includes('project') && projectNetworkAccessAllowed;
+  if (id === 'wsl:execute') return enabledBackends.includes('wsl');
+  if (id === 'wsl:docker') return enabledBackends.includes('wsl-docker');
+  if (id === 'host:execute') return hostShellExecutables.size > 0;
+  return false;
+}
+
+function runtimeToolCapabilities() {
+  const capabilities = new Map();
+  for (const [name, capability] of Object.entries(toolCapabilities)) {
+    if (capabilityAvailable(capability)) capabilities.set(name, capability);
+  }
+  for (const [name, capability] of moduleManager?.getToolCapabilities() ?? []) capabilities.set(name, capability);
+  return capabilities;
+}
+
+function runtimeCapabilityChoices() {
+  const available = new Set(runtimeToolCapabilities().values());
+  if (enabledBackends.includes('docker')) available.add('sandbox:network');
+  if (enabledBackends.includes('project') && projectNetworkAccessAllowed) available.add('project:network');
+  const choices = builtinCapabilityDefinitions.filter((choice) => available.has(choice.id));
+  const included = new Set(choices.map((choice) => choice.id));
+  const modules = moduleManager?.getCapabilityChoices() ?? [];
+  for (const choice of modules) {
+    if (available.has(choice.id) && !included.has(choice.id)) {
+      choices.push(choice);
+      included.add(choice.id);
+    }
+  }
+  return choices;
+}
+
+function createServer(auditContext = {}, activeCapabilities = runtimeToolCapabilities()) {
+  const grants = new Set(activeCapabilities.values());
+  const instructions = [
+    'Choose an available tool that matches the environment the user wants. Prefer scoped tools for simple operations. Use the command tool for the requested environment directly. Batch independent host commands with parallel=true. Keep dependent commands sequential.',
+  ];
+  if (grants.has('sandbox:execute')) {
     instructions.push('For isolated commands, use run_sandbox_bash for one command or run_sandbox_session for up to four commands in one temporary gVisor workspace. The default lifecycle is ephemeral and removes the container after the batch. Choose conversation to retain a session for later calls (15 minutes idle, 60 minutes total) or task for a longer managed workspace (30 minutes idle, 4 hours total); reuse the returned session_id. The server expires and deletes every retained container. Network is off by default; internet_access=true opts a new container into the rootless bridge. Each command is limited to 5 seconds. Managed containers have no host mounts, read-only root, non-root UID, dropped capabilities, no-new-privileges, and per-container resource limits.');
   }
-  if (hostShellExecutables.size > 0) {
-    instructions.push('run_host_commands executes directly on this MCP server machine with the server user’s full host permissions; it does not use Docker or provide sandbox isolation. Use it only when the user requested work on the host. Commands in a batch run sequentially in the selected shell, each with a fresh process and the same working directory. Each command has a 5-second timeout and output is capped at 64 KiB.');
+  if (grants.has('host:execute')) {
+    instructions.push('run_host_commands executes directly on this MCP server machine with the server user’s full host permissions; it does not use Docker or provide sandbox isolation. Use it only when the user requested work on the host. Commands use fresh processes in the same working directory. Set parallel=true only for independent commands. Commands default to a 10-second timeout and can request up to 60 seconds. Output is capped at 64 KiB per command.');
   }
-  if (filesystemBackend) {
-    instructions.push(`Filesystem tools are confined to these configured roots: ${filesystemBackend.roots.join(', ')}. Use list_files, read_file, or search_files to inspect; write_file and edit_file can change files only inside these roots. Reads and search results have size limits.`);
+  if (grants.has('filesystem:read') || grants.has('filesystem:write')) {
+    instructions.push('Filesystem tools operate inside administrator-configured roots. Use the available read or write tools for focused file operations.');
   }
-  if (projectWorkflow) {
-    instructions.push('For a configured web project, create a start_project_session first. It snapshots source into a managed no-host-mount gVisor workspace; the workspace is shared by run_project_checks and start_project_preview, so dependencies and build output persist during the workflow. The snapshot excludes .git, node_modules, environment files, build output, caches, and common credential directories, and is capped by entry count, nesting depth, file count, and bytes. Network mode is fixed when the session starts: internal/no-egress by default. internet_access=true is rejected unless the MCP server administrator enabled MCP_PROJECT_ALLOW_NETWORK=true; when enabled it selects the rootless bridge and may reach host/LAN services visible to it. Rootless Docker can publish preview ports only for bridge sessions, so dependency downloads and browser previews require this operator-side network opt-in. Run only configured install/build/test/lint actions. For browser checks, start_project_preview, use the separate Playwright connector to open the returned loopback URL, save a screenshot under the Playwright output directory if a durable image is needed, then call save_review_screenshot and stop_project_preview. Sessions expire after 30 minutes idle or 2 hours total; stop the session when finished. Review artifacts live under .gemini-mcp/reviews/<review_id>/ in the configured project root.');
+  if (grants.has('wsl:execute')) {
+    instructions.push('Use run_wsl_command for general Bash tasks in the configured WSL distribution. It runs with the WSL user permissions.');
+  }
+  if (grants.has('wsl:docker')) {
+    instructions.push('Use run_wsl_container to run the approved local image with its default command.');
+  }
+  if (grants.has('project:execute')) {
+    instructions.push('For a configured web project, create a start_project_session first. It snapshots source into a managed no-host-mount gVisor workspace; the workspace is shared by run_project_checks and start_project_preview, so dependencies and build output persist during the workflow. The snapshot excludes .git, node_modules, environment files, build output, caches, and common credential directories, and is capped by entry count, nesting depth, file count, and bytes. Network mode is fixed when the session starts: internal/no-egress by default. internet_access=true is rejected unless the MCP server administrator enabled MCP_PROJECT_ALLOW_NETWORK=true; when enabled it selects the rootless bridge and may reach host/LAN services visible to it. Rootless Docker can publish preview ports only for bridge sessions, so dependency downloads and browser previews require this operator-side network opt-in. Run only configured install/build/test/lint actions. For browser checks, start_project_preview, then use the OAuth-authorized mcp_browser_* tools to open the returned loopback URL and inspect it. If a durable screenshot is needed, call browser_take_screenshot and save_review_screenshot; then stop the preview. Sessions expire after 30 minutes idle or 2 hours total; stop the session when finished. Review artifacts live under .gemini-mcp/reviews/<review_id>/ in the configured project root.');
+  }
+  if (moduleManager) {
+    const skills = moduleManager.getActiveSkills();
+    if (skills.length) {
+      instructions.push(`Platform skills are active for ${process.platform}: ${skills.map((skill) => skill.name).join(', ')}. Read the matching gemini-mcp://skills/<id> resource or skill_<id> prompt when its instructions apply.\n\n${skills.map((skill) => `## ${skill.name}\n${skill.content}`).join('\n\n')}`);
+    }
+    const externalTools = moduleManager.getExposedTools().filter(({ name }) => activeCapabilities.has(name));
+    if (externalTools.length) {
+      instructions.push(`Additional MCP modules are proxied through this OAuth-protected server. Their tools require the capability assigned in the local dashboard. Modules currently exposed: ${[...new Set(externalTools.map((tool) => tool.moduleName))].join(', ')}.`);
+    }
   }
   instructions.push('Never include secrets in commands. Gemini approval preferences are controlled by Gemini Connected Apps, not by this MCP server.');
   const server = new McpServer(
@@ -758,33 +868,44 @@ function createServer(auditContext = {}) {
     { instructions: instructions.join(' ') },
   );
   const registerTool = server.registerTool.bind(server);
-  server.registerTool = (name, settings, callback) => registerTool(name, settings, async (...args) => {
-    const metadata = {
-      ...auditMetadata(name, args[0]),
-      capability: toolCapabilities[name],
-      client_fingerprint: auditContext.clientFingerprint,
-      request_id: auditContext.requestId,
-    };
-    // Fail closed: do not execute a tool unless the start event is persisted.
-    await audit.record({ ...metadata, event: 'tool.started' });
-    const started = performance.now();
-    let result;
-    try {
-      result = await callback(...args);
-    } catch (error) {
-      await audit.record({
-        ...metadata, event: 'tool.finished', outcome: 'failure',
+  server.registerTool = (name, settings, callback) => {
+    if (!activeCapabilities.has(name)) return;
+    if (['desktop_act_and_observe', 'desktop_run_steps'].includes(name)
+      && !activeCapabilities.has(desktopPrefix + 'Snapshot')) return;
+    const capability = activeCapabilities.get(name);
+    return registerTool(name, settings, async (...args) => {
+      const metadata = {
+        ...auditMetadata(name, args[0]),
+        capability,
+        client_fingerprint: auditContext.clientFingerprint,
+        request_id: auditContext.requestId,
+      };
+      // Fail closed: do not execute a tool unless the start event is persisted.
+      await audit.record({ ...metadata, event: 'tool.started' });
+      const started = performance.now();
+      let result;
+      try {
+        const input = args[0];
+        result = toolCapabilities[name] === 'project:execute' && input?.review_id
+          ? await projectWorkflow.withOwnedReview(input.project_id, input.review_id, auditContext.clientId, () => callback(...args))
+          : name.startsWith(desktopPrefix)
+            ? await desktopWorkflow.exclusive(() => callback(...args))
+            : await callback(...args);
+      } catch (error) {
+        void audit.recordDeferred({
+          ...metadata, event: 'tool.finished', outcome: 'failure',
+          duration_ms: Math.floor(performance.now() - started),
+        });
+        throw error;
+      }
+      void audit.recordDeferred({
+        ...metadata, event: 'tool.finished',
+        ...auditResultMetadata(result),
         duration_ms: Math.floor(performance.now() - started),
-      });
-      throw error;
-    }
-    await audit.record({
-      ...metadata, event: 'tool.finished',
-      ...auditResultMetadata(result),
-      duration_ms: Math.floor(performance.now() - started),
     });
     return result;
-  });
+    });
+  };
 
   if (enabledBackends.includes('docker')) {
     server.registerTool(
@@ -843,7 +964,7 @@ function createServer(auditContext = {}) {
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       },
       async ({ commands, session_id: sessionId, lifecycle, internet_access: internetAccess }) => (
-        runSandboxSession(commands, { sessionId, lifecycle, internetAccess })
+        runSandboxSession(commands, { sessionId, lifecycle, internetAccess, ownerId: auditContext.clientId })
       ),
     );
   }
@@ -855,14 +976,16 @@ function createServer(auditContext = {}) {
       {
         title: 'Run commands directly on the host',
         description:
-          'Runs up to four commands directly on the computer running this MCP server in the selected Bash or PowerShell executable. This is full host access as the server user; it is not a sandbox and may read, change, or delete host files. Each command gets a fresh shell process and the same working directory, so shell variables and directory changes do not persist between array entries. Results include each exit code, stdout, and stderr. Each command is limited to 1,000 UTF-8 bytes and 5 seconds; combined input is limited to 4,000 bytes and output to 64 KiB. Use only when the user requests host execution and the endpoint is trusted.',
+          'Runs up to four commands directly on the computer running this MCP server in the selected Bash or PowerShell executable. This is full host access as the server user; it is not a sandbox and may read, change, or delete host files. Each command gets a fresh shell process in the same working directory. Set parallel=true for independent commands. Results include each exit code, stdout, and stderr. Each command accepts up to 8 KiB of UTF-8 script and defaults to a 10-second timeout, adjustable up to 60 seconds. Output is capped at 64 KiB per command. Use only when the user requests host execution and the endpoint is trusted.',
         inputSchema: {
-          shell: z.enum(availableShells),
-          commands: z.array(z.string().trim().min(1).max(1_000))
-            .min(1).max(sandboxMaxSessionCommands)
-            .describe('One to four commands in order. Each command is at most 1,000 UTF-8 bytes; all run on the host.'),
+          shell: availableShells.length === 1
+            ? z.enum(availableShells).default(availableShells[0])
+            : z.enum(availableShells),
+          commands: z.array(shellCommandSchema).min(1).max(sandboxMaxSessionCommands),
+          timeout_seconds: shellTimeoutSchema,
           working_directory: z.string().optional()
             .describe('Optional absolute directory on the host. Defaults to the MCP server current directory.'),
+          parallel: z.boolean().optional().describe('Run independent commands concurrently. Results stay in input order.'),
         },
         outputSchema: {
           backend: z.enum(availableShells),
@@ -881,9 +1004,60 @@ function createServer(auditContext = {}) {
         },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       },
-      async ({ shell, commands, working_directory: workingDirectory }) => (
-        runHostCommands(shell, commands, workingDirectory)
+      async ({ shell, commands, working_directory: workingDirectory, parallel, timeout_seconds: timeoutSeconds }) => (
+        runHostCommands(shell, commands, workingDirectory, parallel, timeoutSeconds)
       ),
+    );
+  }
+
+  server.registerTool(
+    'mcp_status',
+    {
+      title: 'Get MCP gateway status',
+      description: 'Reports enabled backends and known child module connection states without starting a live probe.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+      const report = {
+        backends: [...enabledBackends],
+        modules: (moduleManager?.snapshot().modules ?? []).map(({ id, state }) => ({ id, state })),
+      };
+      return { content: [{ type: 'text', text: JSON.stringify(report) }], structuredContent: report };
+    },
+  );
+
+  if (enabledBackends.includes('wsl')) {
+    server.registerTool(
+      'run_wsl_command',
+      {
+        title: 'Run a command in WSL',
+        description: 'Runs Bash as the configured WSL user, including access to Windows files visible to that user.',
+        inputSchema: {
+          command: shellCommandSchema.optional().describe('Single Bash script. Use either command or commands.'),
+          commands: z.array(shellCommandSchema).min(1).max(sandboxMaxSessionCommands).optional(),
+          parallel: z.boolean().optional(),
+          timeout_seconds: shellTimeoutSchema,
+        },
+      },
+      async ({ command, commands, parallel, timeout_seconds: timeoutSeconds }) => {
+        if (Boolean(command) === Boolean(commands)) throw new Error('Provide exactly one of command or commands.');
+        const results = await wslBackend.runShell(commands ?? [command], { parallel, timeoutSeconds });
+        return { content: [{ type: 'text', text: JSON.stringify(commands ? { results } : results[0]) }] };
+      },
+    );
+  }
+
+  if (enabledBackends.includes('wsl-docker')) {
+    server.registerTool(
+      'run_wsl_container',
+      {
+        title: 'Run the approved Docker image from WSL',
+        description: 'Runs the approved local image with its default command, without container network access.',
+        inputSchema: {},
+      },
+      async () => ({
+        content: [{ type: 'text', text: JSON.stringify(await wslBackend.runContainer(wslDockerImage)) }],
+      }),
     );
   }
 
@@ -985,6 +1159,12 @@ function createServer(auditContext = {}) {
     const projectIds = projects.map((project) => project.id);
     const projectIdSchema = z.enum(projectIds);
     const sessionIdSchema = z.string().uuid();
+    const requireOwnedProjectSession = (sessionId) => {
+      const session = projectWorkflow.sessions.get(sessionId);
+      if (!auditContext.clientId || session?.ownerId !== auditContext.clientId) {
+        throw new Error('Project session is not available to this client.');
+      }
+    };
     const projectTextResult = (result) => ({
       content: [{ type: 'text', text: JSON.stringify(result) }],
       structuredContent: result,
@@ -1020,7 +1200,7 @@ function createServer(auditContext = {}) {
         inputSchema: { project_id: projectIdSchema, internet_access: z.boolean().default(false), review_id: z.string().uuid().optional() },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       },
-      async (args) => projectTextResult(await projectWorkflow.createProjectSession(args)),
+      async (args) => projectTextResult(await projectWorkflow.createProjectSession(args, auditContext.clientId)),
     );
 
     server.registerTool(
@@ -1036,7 +1216,10 @@ function createServer(auditContext = {}) {
         },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       },
-      async (args) => projectTextResult(await projectWorkflow.runProjectChecks(args)),
+      async (args) => {
+        requireOwnedProjectSession(args.session_id);
+        return projectTextResult(await projectWorkflow.runProjectChecks(args));
+      },
     );
 
     server.registerTool(
@@ -1047,7 +1230,10 @@ function createServer(auditContext = {}) {
         inputSchema: { project_id: projectIdSchema, session_id: sessionIdSchema, review_id: z.string().uuid().optional() },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
       },
-      async (args) => projectTextResult(await projectWorkflow.startPreview(args)),
+      async (args) => {
+        requireOwnedProjectSession(args.session_id);
+        return projectTextResult(await projectWorkflow.startPreview(args));
+      },
     );
 
     server.registerTool(
@@ -1058,7 +1244,7 @@ function createServer(auditContext = {}) {
         inputSchema: {},
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       },
-      async () => projectTextResult(await projectWorkflow.listProjectSessions()),
+      async () => projectTextResult(await projectWorkflow.listProjectSessions(auditContext.clientId)),
     );
 
     server.registerTool(
@@ -1069,7 +1255,10 @@ function createServer(auditContext = {}) {
         inputSchema: { session_id: sessionIdSchema },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
       },
-      async ({ session_id: sessionId }) => projectTextResult(await projectWorkflow.stopPreview(sessionId)),
+      async ({ session_id: sessionId }) => {
+        requireOwnedProjectSession(sessionId);
+        return projectTextResult(await projectWorkflow.stopPreview(sessionId));
+      },
     );
 
     server.registerTool(
@@ -1080,7 +1269,10 @@ function createServer(auditContext = {}) {
         inputSchema: { session_id: sessionIdSchema },
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
       },
-      async ({ session_id: sessionId }) => projectTextResult(await projectWorkflow.stopProjectSession(sessionId)),
+      async ({ session_id: sessionId }) => {
+        requireOwnedProjectSession(sessionId);
+        return projectTextResult(await projectWorkflow.stopProjectSession(sessionId));
+      },
     );
 
     server.registerTool(
@@ -1096,7 +1288,7 @@ function createServer(auditContext = {}) {
         },
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
       },
-      async (args) => projectTextResult(await projectWorkflow.createReviewRun(args)),
+      async (args) => projectTextResult(await projectWorkflow.createReviewRun(args, auditContext.clientId)),
     );
 
     server.registerTool(
@@ -1155,7 +1347,7 @@ function createServer(auditContext = {}) {
         inputSchema: { project_id: projectIdSchema },
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       },
-      async ({ project_id: projectId }) => projectTextResult(await projectWorkflow.listReviewRuns(projectId)),
+      async ({ project_id: projectId }) => projectTextResult(await projectWorkflow.listReviewRuns(projectId, auditContext.clientId)),
     );
 
     server.registerTool(
@@ -1181,113 +1373,33 @@ function createServer(auditContext = {}) {
     );
   }
 
+  server.registerTool(
+    'desktop_act_and_observe',
+    {
+      title: 'Act and observe one Windows window',
+      description: 'Use the exact foreground window from Snapshot, perform one accessibility action, and return a fresh snapshot. Supply expect to verify the result. No automatic action retry.',
+      inputSchema: { ...desktopWindowSchema, step: desktopStepSchema },
+    },
+    async ({ step, ...window }) => desktopWorkflow.run({ ...window, steps: [step] }, activeCapabilities, moduleManager),
+  );
+
+  server.registerTool(
+    'desktop_run_steps',
+    {
+      title: 'Run a short sequence in one Windows window',
+      description: 'Run up to four actions in order in the expected foreground window. Use exact accessible names or automation IDs. Stops on an adapter error, unexpected foreground window, or unmet expectation and returns the latest snapshot.',
+      inputSchema: { ...desktopWindowSchema, steps: z.array(desktopStepSchema).min(1).max(4) },
+    },
+    async (input) => desktopWorkflow.run(input, activeCapabilities, moduleManager),
+  );
+
+  if (moduleManager) {
+    registerModuleTools(server, moduleManager);
+    registerSkillResources(server, moduleManager.getActiveSkills());
+  }
+
   return server;
 }
-
-function consumeToolCallRateLimit(body) {
-  const callCount = Array.isArray(body)
-    ? body.filter((message) => message?.method === 'tools/call').length
-    : Number(body?.method === 'tools/call');
-  if (callCount === 0) return true;
-
-  const now = Date.now();
-  if (now - toolCallWindowStartedAt >= 60_000) {
-    toolCallWindowStartedAt = now;
-    toolCallsInWindow = 0;
-  }
-  if (toolCallsInWindow + callCount > maxToolCallsPerMinute) return false;
-  toolCallsInWindow += callCount;
-  return true;
-}
-
-const app = createMcpExpressApp({ host: '127.0.0.1' });
-app.use((req, res, next) => {
-  console.log(`HTTP ${req.method} ${req.path}`);
-  res.on('finish', () => console.log(`HTTP status=${res.statusCode}`));
-  next();
-});
-app.use(oauthSecurity.router);
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'gemini-local-bash-poc', backends: enabledBackends }));
-
-app.use(endpointPath, oauthSecurity.requireAuthentication);
-app.post(endpointPath, async (req, res) => {
-  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
-  const capabilities = bearer ? oauthSecurity.provider.capabilitiesForToken(bearer) : [];
-  const denied = deniedToolCall(req.body, capabilities);
-  if (denied) {
-    console.warn(`MCP denied tool=${denied.tool} missingCapability=${denied.capability}`);
-    try {
-      await audit.record({
-        ...auditMetadata(denied.tool),
-        event: 'tool.denied', outcome: 'denied',
-        capability: denied.capability, http_status: 403,
-        client_fingerprint: fingerprintClient(req.auth?.clientId),
-        request_id: newAuditRequestId(),
-      });
-    } catch (error) {
-      console.error('Audit write failure; denying request:', error.message);
-      return res.status(503).json({ error: 'Execution auditing is unavailable; request refused.' });
-    }
-    return res.status(403).json({
-      jsonrpc: '2.0',
-      error: { code: -32003, message: `MCP client is not authorized for capability ${denied.capability}. Reauthorize and explicitly approve this capability.` },
-      id: Array.isArray(req.body) ? null : req.body?.id ?? null,
-    });
-  }
-  if (!consumeToolCallRateLimit(req.body)) {
-    return res.status(429).json({
-      jsonrpc: '2.0',
-      error: { code: -32029, message: 'MCP tool call rate limit exceeded. Retry after one minute.' },
-      id: Array.isArray(req.body) ? null : req.body?.id ?? null,
-    });
-  }
-
-  const methods = Array.isArray(req.body)
-    ? req.body.map((message) => message?.method).filter(Boolean).join(',')
-    : req.body?.method;
-  console.log(`MCP request method=${methods || 'unknown'}`);
-  if (req.body?.method === 'tools/call') {
-    const toolName = req.body.params?.name;
-    const args = req.body.params?.arguments ?? {};
-    if (toolName === 'run_sandbox_bash') {
-      const command = args.command;
-      console.log(`MCP tool=${toolName} commandBytes=${Buffer.byteLength(typeof command === 'string' ? command : '', 'utf8')} internetAccess=${args.internet_access === true}`);
-    } else if (toolName === 'run_sandbox_session') {
-      const commands = Array.isArray(args.commands) ? args.commands : [];
-      const commandBytes = commands.reduce((total, command) => total + Buffer.byteLength(typeof command === 'string' ? command : '', 'utf8'), 0);
-      console.log(`MCP tool=${toolName} commandCount=${commands.length} commandBytes=${commandBytes} lifecycle=${args.lifecycle ?? 'ephemeral'} persistent=${Boolean(args.session_id || ['conversation', 'task'].includes(args.lifecycle))} internetAccess=${args.internet_access === true}`);
-    } else if (toolName === 'run_host_commands') {
-      const commands = Array.isArray(args.commands) ? args.commands : [];
-      const commandBytes = commands.reduce((total, command) => total + Buffer.byteLength(typeof command === 'string' ? command : '', 'utf8'), 0);
-      console.log(`MCP tool=${toolName} shell=${String(args.shell ?? 'unknown')} commandCount=${commands.length} commandBytes=${commandBytes}`);
-    }
-  }
-
-  const server = createServer({
-    clientFingerprint: fingerprintClient(req.auth?.clientId),
-    requestId: newAuditRequestId(),
-  });
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error('MCP request failed:', error instanceof Error ? error.message : 'unknown error');
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
-        id: null,
-      });
-    }
-  } finally {
-    await transport.close().catch(() => {});
-    await server.close().catch(() => {});
-  }
-});
-
-app.get(endpointPath, (_req, res) => res.status(405).json({ error: 'GET is not supported for this stateless endpoint.' }));
-app.delete(endpointPath, (_req, res) => res.status(405).json({ error: 'This stateless endpoint has no session to delete.' }));
 
 async function detectHostShell(shell) {
   const candidates = shell === 'bash'
@@ -1308,6 +1420,13 @@ async function detectHostShell(shell) {
 }
 
 async function start() {
+  if (typeof process.env.MCP_ADMIN_PASSWORD !== 'string'
+    || Buffer.byteLength(process.env.MCP_ADMIN_PASSWORD, 'utf8') < 32) {
+    throw new Error('MCP_ADMIN_PASSWORD must be a separate random password of at least 32 UTF-8 bytes.');
+  }
+  if (process.env.MCP_ADMIN_PASSWORD === process.env.MCP_AUTH_PASSWORD) {
+    throw new Error('MCP_ADMIN_PASSWORD must differ from MCP_AUTH_PASSWORD.');
+  }
   await audit.open();
   if (requestedBackends.includes('docker') || requestedBackends.includes('project')) {
     sandboxDockerHost = defaultSandboxDockerHost();
@@ -1343,6 +1462,17 @@ async function start() {
       enabledBackends.push('filesystem');
       continue;
     }
+    if (backend === 'wsl' || backend === 'wsl-docker') {
+      try {
+        wslBackend ??= createWslBackend(process.env.MCP_WSL_DISTRO);
+        if (backend === 'wsl') await wslBackend.probeShell();
+        else await wslBackend.probeDocker(wslDockerImage);
+        enabledBackends.push(backend);
+      } catch (error) {
+        console.warn(`Requested ${backend} backend is unavailable: ${error.message}`);
+      }
+      continue;
+    }
     const executable = await detectHostShell(backend);
     if (!executable) {
       console.warn(`Requested ${backend} backend was not detected; it will not be exposed.`);
@@ -1351,10 +1481,6 @@ async function start() {
     hostShellExecutables.set(backend, executable);
     enabledBackends.push(backend);
   }
-  if (enabledBackends.length === 0) {
-    throw new Error(`No requested MCP backend is available. Requested: ${requestedBackends.join(', ')}.`);
-  }
-
   if (workspaceManager) {
     let workspaceCleanupActive = false;
     workspaceCleanupTimer = setInterval(async () => {
@@ -1367,10 +1493,46 @@ async function start() {
     workspaceCleanupTimer.unref();
   }
 
-  app.listen(port, '127.0.0.1', () => {
+  if (process.env.MCP_OAUTH_STATE_DB) oauthStateDb = await openOAuthState(process.env.MCP_OAUTH_STATE_DB);
+  oauthSecurity = createMcpOAuthSecurity({
+    db: oauthStateDb,
+    publicUrl: process.env.MCP_PUBLIC_URL,
+    password: process.env.MCP_AUTH_PASSWORD,
+    endpointPath,
+    getCapabilityChoices: runtimeCapabilityChoices,
+  });
+  const moduleConfigPath = process.env.MCP_MODULES_FILE ?? join(process.cwd(), '.gemini-mcp', 'modules.json');
+  const skillPath = fileURLToPath(new URL('../gemini-skill/SKILL.md', import.meta.url));
+  const skillContent = await readFile(skillPath, 'utf8').catch(() => '');
+  moduleManager = new McpModuleManager({
+    configPath: moduleConfigPath,
+    windowsServerPath: process.env.WINDOWS_MCP_SERVER_PATH,
+    skillContent,
+  });
+  await moduleManager.load();
+  if (enabledBackends.length === 0
+    && !moduleManager.snapshot().modules.some((module) => module.state === 'connected')) {
+    throw new Error(`No requested built-in backend or connected MCP module is available. Requested: ${requestedBackends.join(', ')}.`);
+  }
+
+  app = createMcpHttpApp({
+    endpointPath, oauthSecurity, trustProxy: process.env.MCP_TRUST_PROXY, audit,
+    rpcRateLimiter, toolCallRateLimiter, runtimeToolCapabilities, createServer,
+    getProjectSessionNetworkAccess(sessionId, clientId) {
+      const session = projectWorkflow?.sessions.get(sessionId);
+      return session?.ownerId === clientId && session?.internet_access === true;
+    },
+    getSandboxSessionNetworkAccess(sessionId, clientId) {
+      const session = workspaceManager?.row(sessionId);
+      return session?.owner_id === clientId && session?.internet_access === 1;
+    },
+  });
+  mcpListener = app.listen(port, '127.0.0.1', () => {
     console.log(`MCP PoC listening on http://127.0.0.1:${port}${endpointPath}`);
     console.log(`OAuth 2.1/PKCE protection enabled for ${oauthSecurity.resourceUrl.href}. Restart after changing MCP_PUBLIC_URL or MCP_AUTH_PASSWORD.`);
     console.log(`Detected and enabled backends: ${enabledBackends.join(', ')}.`);
+    console.log(`Active MCP modules: ${moduleManager.snapshot().modules.map((module) => `${module.id}=${module.state}`).join(', ') || 'none'}.`);
+    console.log(`Local admin dashboard: http://127.0.0.1:${adminPort}/`);
     console.log(`Redacted structured execution audit enabled: ${auditPath}.`);
     if (enabledBackends.includes('docker')) {
       console.log(`Sandbox Docker daemon: ${sandboxDockerHost} (rootless; runtime=${sandboxRuntime})`);
@@ -1386,6 +1548,43 @@ async function start() {
     if (projectWorkflow) {
       console.log(`Project workflow is enabled for configured aliases: ${projectWorkflow.listProjects().map((project) => project.id).join(', ')}. Source runs only from bounded snapshots inside gVisor; project network access is ${projectNetworkAccessAllowed ? 'operator-enabled' : 'disabled'}; preview ports bind to 127.0.0.1.`);
     }
+  });
+  const dashboard = createAdminDashboard({
+    manager: moduleManager,
+    password: process.env.MCP_ADMIN_PASSWORD,
+    port: adminPort,
+    getRuntimeState: () => ({ backends: [...enabledBackends], capabilities: runtimeCapabilityChoices() }),
+  });
+  adminListener = dashboard.app.listen(dashboard.port, '127.0.0.1', () => {
+    console.log(`Local MCP admin dashboard listening on http://127.0.0.1:${dashboard.port}/.`);
+  });
+}
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Shutting down MCP gateway (${signal}).`);
+  if (workspaceCleanupTimer) clearInterval(workspaceCleanupTimer);
+  await Promise.all([mcpListener, adminListener].filter(Boolean).map((listener) => new Promise((resolve) => {
+    const deadline = setTimeout(() => listener.closeAllConnections(), 15_000);
+    listener.close(() => {
+      clearTimeout(deadline);
+      resolve();
+    });
+    listener.closeIdleConnections();
+  })));
+  const backends = [projectWorkflow, moduleManager, workspaceManager].filter(Boolean);
+  for (const result of await Promise.allSettled(backends.map((backend) => backend.close()))) {
+    if (result.status === 'rejected') console.error('Backend shutdown failed:', result.reason);
+  }
+  oauthStateDb?.close();
+  await audit.close().catch((error) => console.error('Audit shutdown failed:', error.message));
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    if (!shuttingDown) void shutdown(signal).finally(() => process.exit(0));
   });
 }
 

@@ -26,8 +26,48 @@ function workflow(root, profiles = new Map(), options = {}) {
   });
 }
 
+test('project reviews are visible and usable only by their owner', async (t) => {
+  const manager = workflow(await tempDir(t));
+  const { review_id: reviewId } = await manager.createReviewRun({
+    project_id: 'demo', title: 'Review', plan: '', checklist: [],
+  }, 'client-one');
+
+  assert.equal((await manager.listReviewRuns('demo', 'client-one')).reviews.length, 1);
+  assert.equal((await manager.listReviewRuns('demo', 'client-two')).reviews.length, 0);
+  await assert.rejects(
+    manager.withOwnedReview('demo', reviewId, 'client-two', () => assert.fail('unexpected review access')),
+    /not available/,
+  );
+  assert.equal(await manager.withOwnedReview('demo', reviewId, 'client-one', () => 'allowed'), 'allowed');
+});
+
+test('project cleanup runs once when timer ticks overlap', async () => {
+  const manager = workflow(tmpdir());
+  let calls = 0;
+  manager.cleanupExpiredSessions = async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  };
+  const first = manager.runCleanup();
+  const overlapping = manager.runCleanup();
+  assert.equal(overlapping, first);
+  await Promise.all([first, overlapping]);
+  assert.equal(calls, 1);
+  await manager.close();
+});
+
 async function git(root, ...args) {
   return execFileAsync('git', args, { cwd: root, encoding: 'utf8' });
+}
+
+async function symlinkIfAvailable(target, path) {
+  try {
+    await symlink(target, path);
+    return true;
+  } catch (error) {
+    if (process.platform === 'win32' && ['EACCES', 'EPERM'].includes(error.code)) return false;
+    throw error;
+  }
 }
 
 test('project snapshots omit credentials, environment files and symlinks but keep example config', async (t) => {
@@ -49,7 +89,7 @@ test('project snapshots omit credentials, environment files and symlinks but kee
   await writeFile(join(root, '.npmrc'), '//registry.example/:_authToken=fake\n');
   await writeFile(join(root, 'service.pem'), 'FAKE_PRIVATE_KEY\n');
   await writeFile(join(root, 'credentials.json'), '{"token":"fake"}\n');
-  await symlink(join(root, 'app.js'), join(root, 'source-link.js'));
+  const symlinkSupported = await symlinkIfAvailable(join(root, 'app.js'), join(root, 'source-link.js'));
 
   const instance = workflow(root);
   const snapshot = await instance.snapshotProject(root);
@@ -65,8 +105,8 @@ test('project snapshots omit credentials, environment files and symlinks but kee
     }
     assert.deepEqual(await readdir(join(snapshot.directory, 'docs')), [], 'a .env.example directory is not the example file');
     assert.equal(await readFile(join(snapshot.directory, '.env.example'), 'utf8'), 'PUBLIC_SETTING=example\n');
-    await assert.rejects(lstat(join(snapshot.directory, 'source-link.js')), { code: 'ENOENT' });
-    assert.ok(snapshot.totalEntries >= 16, 'directory entries, including filtered and empty directories, are counted');
+    if (symlinkSupported) await assert.rejects(lstat(join(snapshot.directory, 'source-link.js')), { code: 'ENOENT' });
+    assert.ok(snapshot.totalEntries >= (symlinkSupported ? 16 : 15), 'directory entries, including filtered and empty directories, are counted');
   } finally {
     await rm(snapshot.directory, { recursive: true, force: true });
   }
@@ -107,13 +147,14 @@ test('review diff includes regular source files and excludes secrets and untrack
   await writeFile(join(root, 'new.js'), 'new safe file\n');
   await writeFile(join(root, '.env.test'), 'FAKE_TOKEN=must-not-appear\n');
   await writeFile(join(root, 'credentials.json'), '{"token":"must-not-appear"}\n');
-  await symlink(join(root, 'new.js'), join(root, 'new-link.js'));
+  const symlinkSupported = await symlinkIfAvailable(join(root, 'new.js'), join(root, 'new-link.js'));
 
   const result = await workflow(root).getProjectDiff({ project_id: 'demo' });
   assert.equal(result.changed_paths, 2);
   assert.match(result.diff, /tracked\.js/);
   assert.match(result.diff, /new\.js/);
-  assert.doesNotMatch(result.diff, /FAKE_TOKEN|must-not-appear|new-link\.js|credentials\.json/);
+  assert.doesNotMatch(result.diff, /FAKE_TOKEN|must-not-appear|credentials\.json/);
+  if (symlinkSupported) assert.doesNotMatch(result.diff, /new-link\.js/);
 });
 
 test('preview ports are validated and published only on the rootless bridge loopback', async (t) => {

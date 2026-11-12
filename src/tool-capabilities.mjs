@@ -6,6 +6,11 @@ export const toolCapabilities = Object.freeze({
   run_sandbox_bash: 'sandbox:execute',
   run_sandbox_session: 'sandbox:execute',
   run_host_commands: 'host:execute',
+  mcp_status: 'gateway:status',
+  desktop_act_and_observe: 'desktop:interact',
+  desktop_run_steps: 'desktop:interact',
+  run_wsl_command: 'wsl:execute',
+  run_wsl_container: 'wsl:docker',
   list_files: 'filesystem:read',
   read_file: 'filesystem:read',
   search_files: 'filesystem:read',
@@ -29,25 +34,40 @@ export const toolCapabilities = Object.freeze({
 });
 
 /** Return the first denied call, or null if all tool calls are permitted. */
-export function deniedToolCall(body, authorizedCapabilities) {
+export function deniedToolCall(body, authorizedCapabilities, activeToolCapabilities = toolCapabilities, {
+  getSandboxSessionNetworkAccess = () => false,
+  getProjectSessionNetworkAccess = () => false,
+} = {}) {
   const granted = new Set(authorizedCapabilities);
   for (const request of Array.isArray(body) ? body : [body]) {
     if (!request || request.method !== 'tools/call') continue;
     const tool = request.params?.name;
     // Let the MCP protocol handler return method/tool validation errors.
     if (typeof tool !== 'string') continue;
-    const required = toolCapabilities[tool];
+    const required = activeToolCapabilities instanceof Map
+      ? activeToolCapabilities.get(tool)
+      : Object.hasOwn(activeToolCapabilities, tool) ? activeToolCapabilities[tool] : undefined;
     if (!required || !granted.has(required)) {
       return { tool, capability: required ?? 'unknown-tool' };
     }
     const args = request.params?.arguments ?? {};
-    if (args?.internet_access === true) {
-      if (tool === 'run_sandbox_bash' || tool === 'run_sandbox_session') {
-        if (!granted.has('sandbox:network')) return { tool, capability: 'sandbox:network' };
+    if (tool === 'run_sandbox_bash' && args?.internet_access === true
+      && !granted.has('sandbox:network')) {
+      return { tool, capability: 'sandbox:network' };
+    }
+    if (tool === 'run_sandbox_session') {
+      const newSessionRequestsNetwork = args?.internet_access === true;
+      const reusedSessionHasNetwork = typeof args?.session_id === 'string'
+        && getSandboxSessionNetworkAccess(args.session_id) === true;
+      if ((newSessionRequestsNetwork || reusedSessionHasNetwork) && !granted.has('sandbox:network')) {
+        return { tool, capability: 'sandbox:network' };
       }
-      if (tool === 'start_project_session' && !granted.has('project:network')) {
-        return { tool, capability: 'project:network' };
-      }
+    }
+    const startsNetworkProject = tool === 'start_project_session' && args.internet_access === true;
+    const reusesNetworkProject = (tool === 'run_project_checks' || tool === 'start_project_preview')
+      && typeof args.session_id === 'string' && getProjectSessionNetworkAccess(args.session_id) === true;
+    if ((startsNetworkProject || reusesNetworkProject) && !granted.has('project:network')) {
+      return { tool, capability: 'project:network' };
     }
   }
   return null;

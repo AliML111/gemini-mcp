@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer as createTcpServer } from 'node:net';
 import { once } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const serverScript = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
@@ -20,13 +23,24 @@ async function unusedPort() {
 
 test('the running MCP server challenges unauthenticated MCP calls', async (t) => {
   const port = await unusedPort();
+  let adminPort = await unusedPort();
+  while (adminPort === port) adminPort = await unusedPort();
+  const tempDir = await mkdtemp(join(tmpdir(), 'gemini-server-auth-test-'));
+  const moduleConfigPath = join(tempDir, 'modules.json');
+  await writeFile(moduleConfigPath, JSON.stringify({ version: 1, modules: [], skills: [] }));
+  t.after(() => rm(tempDir, { recursive: true, force: true }));
+  const oauthPassword = 'server-auth-test-password-'.padEnd(48, 'x');
+  const adminPassword = 'server-admin-test-password-'.padEnd(48, 'y');
   const child = spawn(process.execPath, [serverScript], {
     env: {
       ...process.env,
-      MCP_BACKENDS: 'bash',
+      MCP_BACKENDS: process.platform === 'win32' ? 'powershell' : 'bash',
       MCP_PORT: String(port),
+      MCP_ADMIN_PORT: String(adminPort),
       MCP_PUBLIC_URL: 'https://mcp.example.test/mcp',
-      MCP_AUTH_PASSWORD: 'server-auth-test-password-'.padEnd(48, 'x'),
+      MCP_AUTH_PASSWORD: oauthPassword,
+      MCP_ADMIN_PASSWORD: adminPassword,
+      MCP_MODULES_FILE: moduleConfigPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -53,4 +67,17 @@ test('the running MCP server challenges unauthenticated MCP calls', async (t) =>
   const response = await fetch(`${baseUrl}/mcp`, { method: 'POST', body: '{}' });
   assert.equal(response.status, 401);
   assert.match(response.headers.get('www-authenticate'), /resource_metadata=/);
+
+  const malformed = await fetch(`${baseUrl}/mcp`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{',
+  });
+  assert.equal(malformed.status, 401, 'bearer authentication runs before JSON parsing');
+
+  const dashboardUrl = `http://127.0.0.1:${adminPort}/api/state`;
+  assert.equal((await fetch(dashboardUrl, {
+    headers: { Authorization: `Basic ${Buffer.from(`admin:${oauthPassword}`).toString('base64')}` },
+  })).status, 401, 'OAuth approval password cannot sign in to the admin dashboard');
+  assert.equal((await fetch(dashboardUrl, {
+    headers: { Authorization: `Basic ${Buffer.from(`admin:${adminPassword}`).toString('base64')}` },
+  })).status, 200, 'the separate admin password can sign in to the dashboard');
 });

@@ -1,3 +1,4 @@
+import { childEnvironment } from './child-environment.mjs';
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import {
@@ -193,9 +194,12 @@ export class ProjectWorkflow {
     this.allowNetworkAccess = allowNetworkAccess === true;
     this.sessions = new Map();
     this.pendingSessions = 0;
+    this.pendingReviews = 0;
+    this.activeReviews = new Set();
     this.activeChecks = 0;
     this.playwrightOutputRoot = playwrightOutputRoot;
     this.cleanupTimer = null;
+    this.cleanupPromise = null;
   }
 
   project(projectId) {
@@ -214,21 +218,29 @@ export class ProjectWorkflow {
   }
 
   async initialize() {
+    if (this.cleanupTimer) return;
     await this.ensurePreviewNetwork();
     await this.cleanupOrphanSessions();
-    this.cleanupTimer = setInterval(() => {
-      this.cleanupExpiredSessions().catch((error) => console.error('Project session cleanup failed:', error.message));
-    }, 30_000);
+    this.cleanupTimer = setInterval(() => this.runCleanup(), 30_000);
     this.cleanupTimer.unref();
   }
 
   async close() {
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
     this.cleanupTimer = null;
+    await this.cleanupPromise?.catch(() => {});
     const results = await Promise.allSettled([...this.sessions.keys()].map((id) => this.stopProjectSession(id)));
     for (const result of results) {
       if (result.status === 'rejected') console.error('Could not stop a project session during shutdown:', result.reason?.message ?? result.reason);
     }
+  }
+
+  runCleanup() {
+    if (this.cleanupPromise) return this.cleanupPromise;
+    this.cleanupPromise = this.cleanupExpiredSessions()
+      .catch((error) => console.error('Project session cleanup failed:', error.message))
+      .finally(() => { this.cleanupPromise = null; });
+    return this.cleanupPromise;
   }
 
   async ensurePreviewNetwork() {
@@ -282,6 +294,7 @@ export class ProjectWorkflow {
     let totalBytes = 0;
     let totalFiles = 0;
     let totalEntries = 0;
+    const filesToCopy = [];
     const { maxBytes, maxFiles, maxEntries, maxDepth } = this.snapshotLimits;
     const visit = async (source, target, depth = 0) => {
       const dir = await opendir(source);
@@ -307,8 +320,7 @@ export class ProjectWorkflow {
             if (totalFiles > maxFiles || totalBytes > maxBytes) {
               throw new Error(`Project snapshot exceeds ${maxFiles} files or ${Math.round(maxBytes / 1024 / 1024)} MiB.`);
             }
-            await copyFile(from, to);
-            await chmod(to, info.mode & 0o755);
+            filesToCopy.push({ from, to, mode: info.mode & 0o755 });
           }
         }
       } finally {
@@ -317,6 +329,22 @@ export class ProjectWorkflow {
     };
     try {
       await visit(root, directory);
+      let nextFile = 0;
+      let copyError = null;
+      const workerCount = Math.min(8, filesToCopy.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (!copyError) {
+          const file = filesToCopy[nextFile++];
+          if (!file) return;
+          try {
+            await copyFile(file.from, file.to);
+            await chmod(file.to, file.mode);
+          } catch (error) {
+            copyError = error;
+          }
+        }
+      }));
+      if (copyError) throw copyError;
       return { directory, totalBytes, totalFiles, totalEntries };
     } catch (error) {
       await rm(directory, { recursive: true, force: true });
@@ -354,12 +382,12 @@ export class ProjectWorkflow {
     }
   }
 
-  async createProjectSession({ project_id: projectId, internet_access: internetAccess = false, review_id: reviewId = null }) {
+  async createProjectSession({ project_id: projectId, internet_access: internetAccess = false, review_id: reviewId = null }, ownerId = null) {
     if (internetAccess && !this.allowNetworkAccess) {
       throw new Error('Project network access is disabled by the MCP server administrator. Set MCP_PROJECT_ALLOW_NETWORK=true to allow internet_access=true.');
     }
     const profile = this.project(projectId);
-    await this.cleanupExpiredSessions();
+    await this.runCleanup();
     if (this.sessions.size + this.pendingSessions >= maxProjectSessions) throw new Error(`At most ${maxProjectSessions} project sessions can run at once.`);
     this.pendingSessions += 1;
     const id = randomUUID();
@@ -389,6 +417,7 @@ export class ProjectWorkflow {
         session_id: id,
         project_id: projectId,
         container_name: containerName,
+        ownerId,
         preview_url: previewUrl,
         preview_running: false,
         internet_access: internetAccess,
@@ -403,7 +432,7 @@ export class ProjectWorkflow {
         }, null, 2), 'session');
       }
       this.sessions.set(id, session);
-      return { ...session, container_name: undefined, network: internetAccess ? 'rootless bridge; outbound and reachable LAN access may be available' : 'internal; outbound disabled' };
+      return { ...session, container_name: undefined, ownerId: undefined, network: internetAccess ? 'rootless bridge; outbound and reachable LAN access may be available' : 'internal; outbound disabled' };
     } catch (error) {
       this.sessions.delete(id);
       await this.docker(['rm', '--force', containerName], { timeout: 10_000 }).catch(() => {});
@@ -491,6 +520,7 @@ export class ProjectWorkflow {
       GIT_OPTIONAL_LOCKS: '0',
     };
     const git = async (args, maxBuffer = 1024 * 1024) => execFileAsync('git', args, {
+      env: childEnvironment(),
       cwd: profile.root,
       env,
       timeout: 5_000,
@@ -548,22 +578,32 @@ export class ProjectWorkflow {
         truncated = true;
       }
     }
-    for (const path of untrackedPaths) {
-      const remainingBytes = maxDiffBytes + 1 - Buffer.byteLength(diff, 'utf8');
-      if (remainingBytes < 1) { truncated = true; break; }
+    const readUntrackedDiff = async (path) => {
       try {
+        const emptyFile = process.platform === 'win32' ? 'NUL' : '/dev/null';
         const result = await git([
-          '-c', 'core.pager=cat', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--no-index', '--', '/dev/null', path,
-        ], remainingBytes);
-        diff += result.stdout;
+          '-c', 'core.pager=cat', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--no-index', '--', emptyFile, path,
+        ], maxDiffBytes + 1);
+        return { stdout: result.stdout, truncated: false };
       } catch (error) {
-        if (error.code === 1 && typeof error.stdout === 'string') diff += error.stdout;
-        else if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-          diff += typeof error.stdout === 'string' ? error.stdout : '';
+        if (error.code === 1 && typeof error.stdout === 'string') return { stdout: error.stdout, truncated: false };
+        if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+          return { stdout: typeof error.stdout === 'string' ? error.stdout : '', truncated: true };
+        }
+        return { error };
+      }
+    };
+    for (let offset = 0; offset < untrackedPaths.length; offset += 4) {
+      const batch = await Promise.all(untrackedPaths.slice(offset, offset + 4).map(readUntrackedDiff));
+      for (const result of batch) {
+        if (result.error) throw new Error(`Could not read untracked file diff: ${result.error.message}`);
+        diff += result.stdout;
+        if (result.truncated || Buffer.byteLength(diff, 'utf8') > maxDiffBytes) {
           truncated = true;
           break;
-        } else throw new Error(`Could not read untracked file diff: ${error.message}`);
+        }
       }
+      if (truncated) break;
     }
     truncated ||= Buffer.byteLength(diff, 'utf8') > maxDiffBytes;
     if (truncated) diff = `${Buffer.from(diff, 'utf8').subarray(0, maxDiffBytes).toString('utf8')}\n[diff truncated at 512 KiB]\n`;
@@ -649,13 +689,18 @@ export class ProjectWorkflow {
   async waitForPreview(url, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     let lastError = 'preview did not respond';
+    let retryDelayMs = 50;
     while (Date.now() < deadline) {
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(1_000), redirect: 'manual' });
+        await response.body?.cancel().catch(() => {});
         if (response.status < 500) return;
         lastError = `preview returned HTTP ${response.status}`;
       } catch (error) { lastError = error.message; }
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(retryDelayMs, remainingMs)));
+      retryDelayMs = Math.min(retryDelayMs * 2, 500);
     }
     throw new Error(`Preview did not become ready within ${Math.round(timeoutMs / 1000)} seconds: ${lastError}`);
   }
@@ -678,9 +723,9 @@ export class ProjectWorkflow {
     return { session_id: sessionId, stopped: true };
   }
 
-  async listProjectSessions() {
+  async listProjectSessions(ownerId = null) {
     return {
-      sessions: [...this.sessions.values()].map(({ session_id, project_id, preview_url, preview_running, internet_access, expires_at, max_expires_at }) => ({
+      sessions: [...this.sessions.values()].filter((session) => session.ownerId === ownerId).map(({ session_id, project_id, preview_url, preview_running, internet_access, expires_at, max_expires_at }) => ({
         session_id, project_id, preview_url, preview_running, internet_access, expires_at, max_expires_at,
       })),
     };
@@ -763,6 +808,7 @@ export class ProjectWorkflow {
     const destination = join(directory, name);
     const current = await lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (current?.isSymbolicLink() || (current && !current.isFile())) throw new Error('Artifact destination must be a regular file.');
+    if (!current && (await readdir(directory)).length >= 20) throw new Error('Review artifact limit reached.');
     const temporaryPath = join(directory, `.artifact-${randomUUID()}.tmp`);
     try {
       await writeFile(temporaryPath, content, { mode: 0o600, flag: 'wx' });
@@ -774,7 +820,25 @@ export class ProjectWorkflow {
     return destination;
   }
 
-  async createReviewRun({ project_id: projectId, title, plan, checklist }) {
+  async withOwnedReview(projectId, reviewId, ownerId, action) {
+    const key = `${projectId}:${reviewId}`;
+    if (this.activeReviews.has(key)) throw new Error('Review is busy. Retry after the current operation finishes.');
+    this.activeReviews.add(key);
+    try {
+      await this.requireReviewOwner(projectId, reviewId, ownerId);
+      return await action();
+    } finally {
+      this.activeReviews.delete(key);
+    }
+  }
+
+  async requireReviewOwner(projectId, reviewId, ownerId) {
+    const directory = await this.getReviewDirectory(this.project(projectId), reviewId);
+    const manifest = JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8'));
+    if (!ownerId || manifest.owner_id !== ownerId) throw new Error('Review is not available to this client.');
+  }
+
+  async createReviewRun({ project_id: projectId, title, plan, checklist }, ownerId = null) {
     const profile = this.project(projectId);
     if (typeof title !== 'string' || !title.trim() || title.length > 200) throw new Error('title must be 1 to 200 characters.');
     if (typeof plan !== 'string' || plan.length > 20_000) throw new Error('plan must be at most 20,000 characters.');
@@ -782,13 +846,23 @@ export class ProjectWorkflow {
       throw new Error('checklist must contain at most 50 non-empty items, each up to 300 characters.');
     }
     const reviewId = randomUUID();
-    const directory = await this.ensureReviewDirectory(profile, reviewId, { create: true });
+    const base = await this.ensureReviewBase(profile, { create: true });
+    this.pendingReviews += 1;
+    let directory;
+    try {
+      const entries = await readdir(base);
+      if (entries.length + this.pendingReviews > 100) throw new Error('Project review storage is full. Archive older review folders locally.');
+      directory = await this.ensureReviewDirectory(profile, reviewId, { create: true });
+    } finally {
+      this.pendingReviews -= 1;
+    }
     const createdAt = new Date().toISOString();
     const planBytes = Buffer.byteLength(`${plan.trim()}\n`, 'utf8');
     const checklistText = `${checklist.map((item) => `- [ ] ${item.trim()}`).join('\n')}\n`;
     const manifest = {
       project_id: projectId,
       review_id: reviewId,
+      owner_id: ownerId,
       title: title.trim(),
       status: 'in_progress',
       created_at: createdAt,
@@ -861,6 +935,7 @@ export class ProjectWorkflow {
     const destination = join(destinationDirectory, filename);
     const current = await lstat(destination).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (current?.isSymbolicLink() || (current && !current.isFile())) throw new Error('Artifact destination must be a regular file.');
+    if (!current && (await readdir(destinationDirectory)).length >= 20) throw new Error('Review artifact limit reached.');
     const temporary = join(destinationDirectory, `.screenshot-${randomUUID()}.tmp`);
     try {
       await copyFile(source, temporary);
@@ -878,7 +953,7 @@ export class ProjectWorkflow {
     return { path: relative(profile.root, destination), media_type: imageTypes.get(extname(filename).toLowerCase()), bytes_written: info.size };
   }
 
-  async listReviewRuns(projectId) {
+  async listReviewRuns(projectId, ownerId = null) {
     const profile = this.project(projectId);
     const directory = await this.ensureReviewBase(profile).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (!directory) return { project_id: projectId, reviews: [] };
@@ -888,7 +963,7 @@ export class ProjectWorkflow {
       if (!entry.isDirectory() || entry.isSymbolicLink() || !/^[0-9a-f-]{36}$/.test(entry.name)) continue;
       try {
         const manifest = JSON.parse(await readFile(join(directory, entry.name, 'manifest.json'), 'utf8'));
-        if (manifest.project_id === projectId && manifest.review_id === entry.name) runs.push(manifest);
+        if (manifest.project_id === projectId && manifest.review_id === entry.name && (manifest.owner_id ?? null) === ownerId) runs.push(manifest);
       } catch { /* Ignore incomplete or malformed review folders. */ }
     }
     runs.sort((left, right) => right.created_at.localeCompare(left.created_at));

@@ -7,6 +7,9 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { SandboxManager } from '../src/sandbox-manager.mjs';
 
+const sandboxTest = process.platform === 'linux' ? test
+  : (name, fn) => test.skip(name, { skip: 'Sandbox manager requires Linux flock(1).' }, fn);
+
 function fakeContainer(name, labels, id = randomUUID()) {
   const labelMap = Object.fromEntries(labels.map((label) => label.split(/=(.*)/s).slice(0, 2)));
   return {
@@ -80,7 +83,7 @@ async function fixture(t, { dockerFake = fakeDocker(), now = () => 1000, maxWork
   return { manager, createManager, dockerFake, dbPath };
 }
 
-test('creates, lists, executes and deletes a SQLite-backed sandbox', async (t) => {
+sandboxTest('creates, lists, executes and deletes a SQLite-backed sandbox', async (t) => {
   const { manager, dockerFake } = await fixture(t);
   const id = await manager.create();
   assert.match(id, /^[0-9a-f-]{36}$/);
@@ -99,7 +102,7 @@ test('creates, lists, executes and deletes a SQLite-backed sandbox', async (t) =
   assert.equal(dockerFake.containers.size, 0);
 });
 
-test('reconcile keeps active workspaces across server restart', async (t) => {
+sandboxTest('reconcile keeps active workspaces across server restart', async (t) => {
   const { manager, createManager, dockerFake } = await fixture(t);
   const id = await manager.create();
   await manager.close();
@@ -112,7 +115,7 @@ test('reconcile keeps active workspaces across server restart', async (t) => {
   await recovered.remove(id);
 });
 
-test('reconcile deletes interrupted busy workspace rather than trusting it', async (t) => {
+sandboxTest('reconcile deletes interrupted busy workspace rather than trusting it', async (t) => {
   const { manager, createManager, dockerFake } = await fixture(t);
   const id = await manager.create();
   manager.db.prepare("UPDATE workspaces SET state='busy' WHERE id=?").run(id);
@@ -125,7 +128,7 @@ test('reconcile deletes interrupted busy workspace rather than trusting it', asy
   assert.equal(dockerFake.containers.size, 0);
 });
 
-test('reconcile completes a crash-interrupted creation when Docker container exists', async (t) => {
+sandboxTest('reconcile completes a crash-interrupted creation when Docker container exists', async (t) => {
   const { manager, createManager } = await fixture(t);
   const id = await manager.create();
   manager.db.prepare("UPDATE workspaces SET state='creating', container_id=NULL WHERE id=?").run(id);
@@ -138,7 +141,7 @@ test('reconcile completes a crash-interrupted creation when Docker container exi
   assert.equal(typeof restarted.row(id).container_id, 'string');
 });
 
-test('reconcile removes untracked containers but refuses mismatched identity', async (t) => {
+sandboxTest('reconcile removes untracked containers but refuses mismatched identity', async (t) => {
   const { manager, dockerFake } = await fixture(t);
   const id = randomUUID();
   const name = `gemini-mcp-ws-${id}`;
@@ -153,14 +156,14 @@ test('reconcile removes untracked containers but refuses mismatched identity', a
   assert.equal(dockerFake.containers.size, 1);
 });
 
-test('reconcile removes crashed one-shot command containers', async (t) => {
+sandboxTest('reconcile removes crashed one-shot command containers', async (t) => {
   const { manager, dockerFake } = await fixture(t);
   dockerFake.containers.set('gemini-mcp-run-1234', fakeContainer('gemini-mcp-run-1234', ['gemini-mcp-poc.managed=true']));
   await manager.reconcile();
   assert.equal(dockerFake.containers.size, 0);
 });
 
-test('TTL expires workspaces, but not active Docker execs', async (t) => {
+sandboxTest('TTL expires workspaces, but not active Docker execs', async (t) => {
   let clock = 1000;
   const { manager } = await fixture(t, { now: () => clock });
   const id = await manager.create();
@@ -181,7 +184,7 @@ test('TTL expires workspaces, but not active Docker execs', async (t) => {
   assert.deepEqual(manager.list(), []);
 });
 
-test('rejects concurrent operations or removal while workspace is busy', async (t) => {
+sandboxTest('rejects concurrent operations or removal while workspace is busy', async (t) => {
   const { manager } = await fixture(t);
   const id = await manager.create();
   let release;
@@ -194,7 +197,7 @@ test('rejects concurrent operations or removal while workspace is busy', async (
   await manager.remove(id);
 });
 
-test('enforces workspace cap even with concurrent requests', async (t) => {
+sandboxTest('enforces workspace cap even with concurrent requests', async (t) => {
   const { manager } = await fixture(t);
   const outcomes = await Promise.allSettled([manager.create(), manager.create(), manager.create()]);
   assert.equal(outcomes.filter((item) => item.status === 'fulfilled').length, 2);
@@ -202,7 +205,7 @@ test('enforces workspace cap even with concurrent requests', async (t) => {
   assert.equal(manager.list().length, 2);
 });
 
-test('failed container deletion remains tracked for retry', async (t) => {
+sandboxTest('failed container deletion remains tracked for retry', async (t) => {
   const { manager, dockerFake } = await fixture(t);
   const id = await manager.create();
   dockerFake.setFailRemove(true);
@@ -213,7 +216,23 @@ test('failed container deletion remains tracked for retry', async (t) => {
   assert.equal(manager.list().length, 0);
 });
 
-test('missing container and expired workspace are pruned during reconcile', async (t) => {
+test('cleanup continues after one workspace fails identity verification', async () => {
+  const removed = [];
+  const manager = {
+    maintenance: null,
+    rows: () => [{ id: 'invalid', state: 'deleting' }, { id: 'valid', state: 'deleting' }],
+    expired: () => false,
+    deleteRow: async (row) => {
+      if (row.id === 'invalid') throw new Error('container identity mismatch');
+      removed.push(row.id);
+    },
+  };
+  await assert.rejects(SandboxManager.prototype.cleanupExpired.call(manager), /identity mismatch/);
+  assert.deepEqual(removed, ['valid'], 'one bad row does not block cleanup of other workspaces');
+  assert.equal(manager.maintenance, null, 'cleanup lock is released even when one row fails');
+});
+
+sandboxTest('missing container and expired workspace are pruned during reconcile', async (t) => {
   const { manager, createManager, dockerFake } = await fixture(t);
   const id = await manager.create();
   dockerFake.containers.clear();
@@ -227,7 +246,7 @@ test('missing container and expired workspace are pruned during reconcile', asyn
 });
 
 
-test('refuses workspace deletion while it is still being created', async (t) => {
+sandboxTest('refuses workspace deletion while it is still being created', async (t) => {
   const { manager } = await fixture(t);
   const id = await manager.create();
   manager.db.prepare("UPDATE workspaces SET state='creating' WHERE id=?").run(id);
@@ -235,7 +254,7 @@ test('refuses workspace deletion while it is still being created', async (t) => 
   assert(manager.row(id));
 });
 
-test('orphan cleanup fails closed for unexpected isolation settings', async (t) => {
+sandboxTest('orphan cleanup fails closed for unexpected isolation settings', async (t) => {
   const { manager, dockerFake } = await fixture(t);
   const id = randomUUID();
   const name = `gemini-mcp-ws-${id}`;
@@ -248,7 +267,7 @@ test('orphan cleanup fails closed for unexpected isolation settings', async (t) 
   assert.equal(dockerFake.containers.size, 1);
 });
 
-test('second manager cannot take the same SQLite owner lock until first closes', async (t) => {
+sandboxTest('second manager cannot take the same SQLite owner lock until first closes', async (t) => {
   const { manager, createManager } = await fixture(t);
   const contender = createManager();
   await assert.rejects(contender.open(), /already owned by another MCP process/);
@@ -259,7 +278,7 @@ test('second manager cannot take the same SQLite owner lock until first closes',
   assert.deepEqual(contender.list(), []);
 });
 
-test('failed database initialization releases owner lock for a retry', async (t) => {
+sandboxTest('failed database initialization releases owner lock for a retry', async (t) => {
   const { manager, createManager } = await fixture(t);
   await manager.close();
   const retry = createManager();
@@ -268,7 +287,7 @@ test('failed database initialization releases owner lock for a retry', async (t)
   assert.deepEqual(retry.list(), []);
 });
 
-test('kernel lock is released after abrupt owner-process death', async (t) => {
+sandboxTest('kernel lock is released after abrupt owner-process death', async (t) => {
   const { manager, createManager, dbPath } = await fixture(t);
   await manager.close();
   const source = [

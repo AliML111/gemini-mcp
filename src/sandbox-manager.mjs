@@ -20,6 +20,8 @@ function validId(id) {
   return typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id);
 }
 
+class WorkspaceVerificationError extends Error {}
+
 function validateContainer(container, row, sandboxImage = null) {
   if (!container) throw new Error(`Workspace ${row.id} has no Docker container.`);
   const labels = container.Config?.Labels ?? {};
@@ -29,7 +31,7 @@ function validateContainer(container, row, sandboxImage = null) {
       || labels['gemini-mcp-poc.workspace'] !== 'true'
       || labels[WORKSPACE_ID_LABEL] !== row.id
       || (row.container_id && container.Id !== row.container_id)) {
-    throw new Error(`Docker container identity mismatch for workspace ${row.id}; refusing to touch it.`);
+    throw new WorkspaceVerificationError(`Docker container identity mismatch for workspace ${row.id}; refusing to touch it.`);
   }
   const host = container.HostConfig ?? {};
   const expectedNetworkMode = row.internet_access ? 'bridge' : 'none';
@@ -49,7 +51,7 @@ function validateContainer(container, row, sandboxImage = null) {
       || !Array.isArray(host.CapDrop) || !host.CapDrop.includes('ALL')
       || !Array.isArray(host.SecurityOpt) || !host.SecurityOpt.includes('no-new-privileges=true')
       || !String(host.Tmpfs?.['/workspace'] ?? '').includes('size=16m')) {
-    throw new Error(`Workspace ${row.id} has unexpected Docker isolation settings; refusing to use it.`);
+    throw new WorkspaceVerificationError(`Workspace ${row.id} has unexpected Docker isolation settings; refusing to use it.`);
   }
   return container;
 }
@@ -99,6 +101,12 @@ export class SandboxManager {
       );
     `);
     const columns = this.db.prepare('PRAGMA table_info(workspaces)').all();
+    if (!columns.some((column) => column.name === 'quarantined')) {
+      this.db.exec('ALTER TABLE workspaces ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!columns.some((column) => column.name === 'owner_id')) {
+      this.db.exec('ALTER TABLE workspaces ADD COLUMN owner_id TEXT');
+    }
     if (!columns.some((column) => column.name === 'internet_access')) {
       this.db.exec('ALTER TABLE workspaces ADD COLUMN internet_access INTEGER NOT NULL DEFAULT 0 CHECK (internet_access IN (0,1))');
     }
@@ -148,11 +156,22 @@ export class SandboxManager {
 
   async verify(row, { requireRunning = false } = {}) {
     const container = await this.inspectDocker(row.container_name);
-    if (container) validateContainer(container, row, this.sandboxImage);
+    if (container) this.validateTrackedContainer(container, row);
     if (requireRunning && !container?.State?.Running) {
       throw new Error(`Workspace ${row.id} container is not running.`);
     }
     return container;
+  }
+
+  validateTrackedContainer(container, row) {
+    try {
+      validateContainer(container, row, this.sandboxImage);
+    } catch (error) {
+      if (error instanceof WorkspaceVerificationError) {
+        this.db.prepare("UPDATE workspaces SET state = 'deleting', quarantined = 1 WHERE id = ?").run(row.id);
+      }
+      throw error;
+    }
   }
 
   async deleteRow(row) {
@@ -175,12 +194,16 @@ export class SandboxManager {
   async cleanupExpired() {
     if (this.maintenance) return this.maintenance;
     this.maintenance = (async () => {
+      const failures = [];
       for (const row of this.rows()) {
         if (row.state === 'busy') continue;
         if (row.state === 'deleting' || (row.state !== 'creating' && this.expired(row))) {
-          await this.deleteRow(row);
+          try { await this.deleteRow(row); }
+          catch (error) { failures.push(error); }
         }
       }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, 'Could not clean up one or more sandbox workspaces.');
     })();
     try { await this.maintenance; } finally { this.maintenance = null; }
   }
@@ -206,7 +229,13 @@ export class SandboxManager {
       }
       const id = labels[WORKSPACE_ID_LABEL];
       const row = known.get(id);
-      if (row) validateContainer(container, row, this.sandboxImage);
+      if (row) {
+        try { this.validateTrackedContainer(container, row); }
+        catch (error) {
+          if (!(error instanceof WorkspaceVerificationError)) throw error;
+          console.warn(error.message);
+        }
+      }
       if (!row) {
         // An orphan must not consume the fixed workspace capacity forever.
         // Verify identity/isolation before deleting it; otherwise fail closed.
@@ -216,7 +245,12 @@ export class SandboxManager {
       }
     }
     for (const row of this.rows()) {
-      const container = await this.verify(row);
+      let container;
+      try { container = await this.verify(row); }
+      catch (error) {
+        if (!(error instanceof WorkspaceVerificationError)) throw error;
+        continue;
+      }
       if (row.state === 'busy' || row.state === 'deleting' || this.expired(row)
           || !container || !container.State?.Running) {
         // A process crash during exec cannot establish whether that command
@@ -233,11 +267,15 @@ export class SandboxManager {
     }
   }
 
-  async create({ internetAccess = false, lifecycle = 'conversation' } = {}) {
+  async create({ internetAccess = false, lifecycle = 'conversation', ownerId = null } = {}) {
     if (typeof internetAccess !== 'boolean') throw new Error('internetAccess must be a boolean.');
     const policy = this.lifecyclePolicies[lifecycle];
     if (!policy || lifecycle === 'ephemeral') throw new Error('Workspace lifecycle must be conversation or task.');
-    await this.cleanupExpired();
+    try {
+      await this.cleanupExpired();
+    } catch (error) {
+      console.error('Workspace cleanup failed during allocation:', error.message);
+    }
     const id = this.uuid();
     if (!validId(id)) throw new Error('UUID generator returned an invalid v4 UUID.');
     const name = `${WORKSPACE_PREFIX}${id}`;
@@ -245,10 +283,10 @@ export class SandboxManager {
     // Sync transaction means parallel requests in this process cannot overbook.
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const { count } = this.db.prepare('SELECT count(*) AS count FROM workspaces').get();
+      const { count } = this.db.prepare('SELECT count(*) AS count FROM workspaces WHERE quarantined = 0').get();
       if (count >= this.maxWorkspaces) throw new Error('All temporary sessions are in use. Wait for idle cleanup or retry after one expires.');
-      this.db.prepare('INSERT INTO workspaces (id,container_name,created_at,last_used_at,internet_access,lifecycle,idle_ttl_ms,max_lifetime_ms,state) VALUES (?,?,?,?,?,?,?,?,?)')
-        .run(id, name, now, now, Number(internetAccess), lifecycle, policy.idleTtlMs, policy.maxLifetimeMs, 'creating');
+      this.db.prepare('INSERT INTO workspaces (id,container_name,created_at,last_used_at,internet_access,lifecycle,idle_ttl_ms,max_lifetime_ms,state,owner_id) VALUES (?,?,?,?,?,?,?,?,?,?)')
+        .run(id, name, now, now, Number(internetAccess), lifecycle, policy.idleTtlMs, policy.maxLifetimeMs, 'creating', ownerId);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -311,6 +349,7 @@ export class SandboxManager {
     return this.rows().map((row) => ({
       workspace_id: row.id,
       state: row.state,
+      quarantined: row.quarantined === 1,
       internet_access: Boolean(row.internet_access),
       lifecycle: row.lifecycle ?? 'conversation',
       created_at: new Date(row.created_at).toISOString(),

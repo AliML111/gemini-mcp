@@ -1,4 +1,5 @@
 node_modules/
 npm-debug.log*
 .env
+.gemini-mcp/modules.json
 .gemini-mcp/reviews/

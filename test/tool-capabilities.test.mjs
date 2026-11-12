@@ -28,6 +28,20 @@ test('network permission is independent from sandbox execution', () => {
     ['sandbox:execute', 'sandbox:network']), null);
 });
 
+test('reusing a network-enabled sandbox session requires the network capability', () => {
+  const getSandboxSessionNetworkAccess = (id) => id === 'network-session';
+  assert.deepEqual(deniedToolCall(tool('run_sandbox_session', {
+    commands: ['date'], session_id: 'network-session',
+  }), ['sandbox:execute'], undefined, { getSandboxSessionNetworkAccess }),
+  { tool: 'run_sandbox_session', capability: 'sandbox:network' });
+  assert.equal(deniedToolCall(tool('run_sandbox_session', {
+    commands: ['date'], session_id: 'offline-session',
+  }), ['sandbox:execute'], undefined, { getSandboxSessionNetworkAccess }), null);
+  assert.equal(deniedToolCall(tool('run_sandbox_session', {
+    commands: ['date'], session_id: 'network-session',
+  }), ['sandbox:execute', 'sandbox:network'], undefined, { getSandboxSessionNetworkAccess }), null);
+});
+
 test('host, filesystem write, and project network access each need separate authorization', () => {
   assert.equal(deniedToolCall(tool('read_file'), ['filesystem:read']), null);
   assert.deepEqual(deniedToolCall(tool('write_file'), ['filesystem:read']),
@@ -36,6 +50,16 @@ test('host, filesystem write, and project network access each need separate auth
     { tool: 'run_host_commands', capability: 'host:execute' });
   assert.deepEqual(deniedToolCall(tool('start_project_session', { internet_access: true }), ['project:execute']),
     { tool: 'start_project_session', capability: 'project:network' });
+});
+
+test('network-enabled project checks and previews require the network grant', () => {
+  const context = { getProjectSessionNetworkAccess: (id) => id === 'network-session' };
+  for (const name of ['run_project_checks', 'start_project_preview']) {
+    const request = tool(name, { session_id: 'network-session' });
+    assert.deepEqual(deniedToolCall(request, ['project:execute'], toolCapabilities, context),
+      { tool: name, capability: 'project:network' });
+    assert.equal(deniedToolCall(request, ['project:execute', 'project:network'], toolCapabilities, context), null);
+  }
 });
 
 test('a JSON-RPC batch denies if any call exceeds its grants', () => {
